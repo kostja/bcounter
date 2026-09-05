@@ -1,147 +1,141 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Konstantin Osipov.
 
-//! A map of named [`BCounter`]s -- one quota per scope, charged as a path.
+//! A map of named [`Escrow`]s -- one quota per scope, spent as a path.
 //!
-//! The naming follows Akka's `PNCounterMap` (a map of named counters); this is the same shape
-//! with [`BCounter`] values. It exists because a single write is often subject to **several**
-//! limits at once: an object counts against its bucket's capacity, its tenant's, and the
-//! cluster's; a request counts against a user's quota and a global one. Those scopes form a
-//! path, and a write must be admitted by **every** level or by none -- charging the inner scope
-//! but not the outer would leave the outer understated the moment the write is refused higher
-//! up.
+//! A single write is often subject to several limits at once: an object counts against its
+//! bucket's capacity, its tenant's, and the cluster's. Those scopes form a path, and a write
+//! must be admitted by **every** level or by none. [`EscrowMap`] holds one [`Escrow`] per scope
+//! and spends across a whole path **all-or-none**.
 //!
-//! # All-or-none fan-out
+//! Spending here is purely local: it checks the rights already granted to each scope, no pool
+//! and no view of other nodes. When a scope is short, [`spend`](EscrowMap::spend) names it and
+//! charges nothing; the shell then tops that scope up from its pool (via
+//! [`grant`](EscrowMap::grant)) and retries. Keeping the pool out of the fan-out is what lets
+//! the map stay pure -- each scope has its own limit and therefore its own pool, and that
+//! bookkeeping belongs to the shell.
 //!
-//! [`inc`](BCounterMap::inc) takes the whole path -- each scope with its own limit -- and one
-//! amount. It checks every scope first and records nothing unless all have room, so a refused
-//! write leaves no partial charge behind and the caller gets back the scope that ran out. No
-//! rollback: the check precedes the first mutation.
-//!
-//! # Limits live at the call site, not in the merged state
-//!
-//! A scope's limit is passed in on every call, applied afresh. The merged state is pure usage
-//! -- the per-node slots of each [`BCounter`] -- so reconfiguring a limit takes effect on the
-//! next call with no state change to gossip, and two nodes that briefly disagree on a limit
-//! still converge on usage. This is why [`available`](BCounterMap::available) takes the limit
-//! as an argument rather than reading a stored one.
-//!
-//! # Sparse
-//!
-//! A scope appears only once it has usage: an untouched scope reads zero and costs nothing, and
-//! a *denied* charge creates no entry. A map over a million idle scopes holds a million
-//! nothings.
+//! Sparse: a scope appears only once it is granted rights or spends; an untouched scope reads
+//! zero and costs nothing.
 
 use std::collections::BTreeMap;
 
-use crate::{BCounter, Denied};
+use crate::{Denied, Escrow};
 
-/// A map of per-scope capacity counters, keyed by scope identity `K`.
+/// A map of per-scope escrow counters, keyed by scope identity `K`.
 ///
-/// `K` is whatever names a limited scope -- a bucket id, a tenant id, a `(kind, id)` pair.
-/// `Id` is the node identity of the underlying [`BCounter`]s (defaults to `u32`). See the
-/// module docs for the fan-out and limit model.
+/// `K` names a limited scope (a bucket id, a tenant id, a `(kind, id)` pair); `Id` is the node
+/// identity of the underlying [`Escrow`]s (defaults to `u32`). See the module docs.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BCounterMap<K: Ord + Clone, Id: Ord + Clone = u32> {
-    /// This node's slot, stamped into every counter it creates.
+pub struct EscrowMap<K: Ord + Clone, Id: Ord + Clone = u32> {
+    /// This node's slot, stamped into every escrow it creates.
     me: Id,
-    /// One counter per scope that has usage. Sparse.
-    counters: BTreeMap<K, BCounter<Id>>,
+    /// One escrow per scope with rights or usage. Sparse.
+    escrows: BTreeMap<K, Escrow<Id>>,
 }
 
-impl<K: Ord + Clone, Id: Ord + Clone> BCounterMap<K, Id> {
+impl<K: Ord + Clone, Id: Ord + Clone> EscrowMap<K, Id> {
     /// A fresh, empty map for the node identified by `me`.
     #[must_use]
     pub fn new(me: Id) -> Self {
         Self {
             me,
-            counters: BTreeMap::new(),
+            escrows: BTreeMap::new(),
         }
     }
 
-    /// True until the first scope gains usage.
+    /// True until the first scope gains rights or usage.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.counters.is_empty()
+        self.escrows.is_empty()
     }
 
-    /// Net usage recorded against `scope`, from this node's view. Zero for an untouched scope.
+    /// Rights this node can still spend on `scope` without asking its pool. Zero for an
+    /// untouched scope.
     #[must_use]
-    pub fn read(&self, scope: &K) -> u64 {
-        self.counters.get(scope).map_or(0, BCounter::read)
+    pub fn local_available(&self, scope: &K) -> u64 {
+        self.escrows.get(scope).map_or(0, Escrow::local_available)
     }
 
-    /// Room left under `limit` for `scope`, from this node's view. The limit is supplied here,
-    /// not stored -- see the module docs.
+    /// Global net usage recorded against `scope`, from this node's merged view.
     #[must_use]
-    pub fn available(&self, scope: &K, limit: u64) -> u64 {
-        limit.saturating_sub(self.read(scope))
+    pub fn global_used(&self, scope: &K) -> u64 {
+        self.escrows.get(scope).map_or(0, Escrow::global_used)
     }
 
-    /// Charge `amount` against every scope on `path`, all-or-none.
+    /// Grant `amount` rights to one `scope`, creating its escrow if new. This is how the shell
+    /// tops a scope up after draining its pool.
+    pub fn grant(&mut self, scope: &K, amount: u64) {
+        let me = self.me.clone();
+        self.escrows
+            .entry(scope.clone())
+            .or_insert_with(|| Escrow::new(me, 0))
+            .grant(amount);
+    }
+
+    /// Spend `amount` against every scope on `path`, all-or-none, from rights already granted.
     ///
-    /// Each entry pairs a scope with its current limit. Every scope is checked before any is
-    /// charged, so on refusal nothing is recorded and no entry is created; on success the
-    /// amount lands on this node's slot in each scope. Scopes on a path are expected distinct
-    /// (a bucket, its tenant, the root -- never the same scope twice).
+    /// Every scope is checked before any is charged, so on a shortfall nothing is spent and no
+    /// escrow is created. Scopes on a path are expected distinct (a bucket, its tenant, the
+    /// root -- never the same scope twice).
     ///
     /// # Errors
     ///
-    /// The first scope (in `path` order) that lacks room, with its [`Denied`]. Nothing is
-    /// charged in that case.
-    pub fn inc(&mut self, path: &[(K, u64)], amount: u64) -> Result<(), (K, Denied)> {
-        // Check every level first; a partial charge is never allowed to exist.
-        for (scope, limit) in path {
-            let used = self.read(scope);
-            if u128::from(used) + u128::from(amount) > u128::from(*limit) {
-                return Err((
-                    scope.clone(),
-                    Denied {
-                        available: limit.saturating_sub(used),
-                    },
-                ));
+    /// The first scope (in `path` order) whose local rights are short, with its [`Denied`].
+    /// Nothing is spent; the caller tops that scope up (see [`grant`](EscrowMap::grant)) and
+    /// retries.
+    pub fn spend(&mut self, path: &[K], amount: u64) -> Result<(), (K, Denied)> {
+        for scope in path {
+            let available = self.local_available(scope);
+            if available < amount {
+                return Err((scope.clone(), Denied { available }));
             }
         }
-        // All had room: record on each. The limit is refreshed into the counter so its own
-        // guard agrees with what we just checked, then the charge -- known to fit -- lands.
-        let me = self.me.clone();
-        for (scope, limit) in path {
-            let counter = self
-                .counters
-                .entry(scope.clone())
-                .or_insert_with(|| BCounter::new(me.clone(), *limit));
-            counter.set_limit(*limit);
-            let _ = counter.inc(amount);
+        for scope in path {
+            // Guaranteed to succeed: every scope was just checked to have room.
+            let _ = self
+                .escrows
+                .get_mut(scope)
+                .expect("a scope with room exists")
+                .spend(amount);
         }
         Ok(())
     }
 
-    /// Free `amount` from every scope on `path`. Always succeeds; a free only lowers usage.
-    pub fn dec(&mut self, path: &[K], amount: u64) {
+    /// Return `amount` rights on every scope on `path` -- a free, a delete. Always succeeds.
+    pub fn refund(&mut self, path: &[K], amount: u64) {
         let me = self.me.clone();
         for scope in path {
-            self.counters
+            self.escrows
                 .entry(scope.clone())
-                .or_insert_with(|| BCounter::new(me.clone(), u64::MAX))
-                .dec(amount);
+                .or_insert_with(|| Escrow::new(me.clone(), 0))
+                .refund(amount);
         }
     }
 
-    /// Every scope with usage, and its net usage. For metrics and inspection.
-    pub fn iter(&self) -> impl Iterator<Item = (&K, u64)> {
-        self.counters.iter().map(|(scope, c)| (scope, c.read()))
+    /// Return up to `amount` unused rights on one `scope` toward its pool. Returns how much was
+    /// reclaimed (see [`Escrow::reclaim`]).
+    #[must_use]
+    pub fn reclaim(&mut self, scope: &K, amount: u64) -> u64 {
+        self.escrows.get_mut(scope).map_or(0, |e| e.reclaim(amount))
     }
 
-    /// Fold another replica's map in: merge each scope's counter, scope by scope. The join that
-    /// makes the map a CRDT -- idempotent, commutative, associative, so replicas converge under
-    /// gossip in any order. A scope only this replica knows is kept; one only the other knows
-    /// is adopted.
+    /// Every scope with usage, and its global net usage. For metrics and inspection.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, u64)> {
+        self.escrows
+            .iter()
+            .map(|(scope, e)| (scope, e.global_used()))
+    }
+
+    /// Fold another replica's map in: merge each scope's escrow view, scope by scope. The join
+    /// that makes the observation a CRDT -- idempotent, commutative, associative, so replicas
+    /// converge under gossip in any order. Local grants are untouched.
     pub fn merge(&mut self, other: &Self) {
         let me = self.me.clone();
-        for (scope, their) in &other.counters {
-            self.counters
+        for (scope, their) in &other.escrows {
+            self.escrows
                 .entry(scope.clone())
-                .or_insert_with(|| BCounter::new(me.clone(), their.limit()))
+                .or_insert_with(|| Escrow::new(me.clone(), 0))
                 .merge(their);
         }
     }
@@ -152,111 +146,97 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Three scopes on a path, tightest in the middle, at the given per-scope limits.
-    fn path(bucket: u64, tenant: u64, root: u64) -> [(&'static str, u64); 3] {
-        [("bucket", bucket), ("tenant", tenant), ("root", root)]
+    /// Grant the three scopes of a path their per-scope rights on one node.
+    fn granted(bucket: u64, tenant: u64, root: u64) -> EscrowMap<&'static str> {
+        let mut m: EscrowMap<&str> = EscrowMap::new(1);
+        m.grant(&"bucket", bucket);
+        m.grant(&"tenant", tenant);
+        m.grant(&"root", root);
+        m
     }
 
     #[test]
     fn a_fresh_map_is_empty_and_reads_zero() {
-        let m: BCounterMap<&str> = BCounterMap::new(1);
+        let m: EscrowMap<&str> = EscrowMap::new(1);
         assert!(m.is_empty());
-        assert_eq!(m.read(&"bucket"), 0);
-        assert_eq!(m.available(&"bucket", 100), 100);
+        assert_eq!(m.local_available(&"bucket"), 0);
+        assert_eq!(m.global_used(&"bucket"), 0);
     }
 
     #[test]
-    fn a_charge_within_every_limit_lands_on_all_levels() {
-        let mut m: BCounterMap<&str> = BCounterMap::new(1);
-        assert_eq!(m.inc(&path(100, 500, 9999), 40), Ok(()));
-        assert_eq!(m.read(&"bucket"), 40);
-        assert_eq!(m.read(&"tenant"), 40);
-        assert_eq!(m.read(&"root"), 40);
+    fn a_spend_within_every_grant_lands_on_all_levels() {
+        let mut m = granted(100, 500, 9999);
+        assert_eq!(m.spend(&["bucket", "tenant", "root"], 40), Ok(()));
+        assert_eq!(m.global_used(&"bucket"), 40);
+        assert_eq!(m.global_used(&"tenant"), 40);
+        assert_eq!(m.global_used(&"root"), 40);
     }
 
     #[test]
-    fn a_charge_over_one_level_is_refused_and_nothing_is_recorded() {
-        let mut m: BCounterMap<&str> = BCounterMap::new(1);
-        // Fits the bucket (100) but not the tenant (30).
-        let denied = m.inc(&path(100, 30, 9999), 40);
+    fn a_spend_short_at_one_level_charges_nothing() {
+        let mut m = granted(100, 30, 9999);
+        // Fits the bucket (100) but not the tenant grant (30).
+        let denied = m.spend(&["bucket", "tenant", "root"], 40);
         assert_eq!(denied, Err(("tenant", Denied { available: 30 })));
-        // All-or-none: not even the level that had room is charged, and nothing is created.
-        assert!(m.is_empty());
-        assert_eq!(m.read(&"bucket"), 0);
-        assert_eq!(m.read(&"root"), 0);
+        // All-or-none: not even the level that had room is charged.
+        assert_eq!(m.global_used(&"bucket"), 0);
+        assert_eq!(m.global_used(&"tenant"), 0);
+        assert_eq!(m.global_used(&"root"), 0);
     }
 
     #[test]
-    fn the_denied_scope_is_the_first_one_short_in_path_order() {
-        let mut m: BCounterMap<&str> = BCounterMap::new(1);
-        // Both bucket and tenant are too small; the bucket comes first on the path.
-        let denied = m.inc(&path(10, 20, 9999), 40);
+    fn the_short_scope_is_the_first_one_in_path_order() {
+        let mut m = granted(10, 20, 9999);
+        let denied = m.spend(&["bucket", "tenant", "root"], 40);
         assert_eq!(denied, Err(("bucket", Denied { available: 10 })));
     }
 
     #[test]
-    fn a_free_lowers_every_level() {
-        let mut m: BCounterMap<&str> = BCounterMap::new(1);
-        m.inc(&path(100, 500, 9999), 80).unwrap();
-        m.dec(&["bucket", "tenant", "root"], 30);
-        assert_eq!(m.read(&"bucket"), 50);
-        assert_eq!(m.read(&"tenant"), 50);
-        assert_eq!(m.read(&"root"), 50);
+    fn a_top_up_reopens_a_short_scope() {
+        let mut m = granted(100, 30, 9999);
+        assert!(m.spend(&["bucket", "tenant", "root"], 40).is_err());
+        m.grant(&"tenant", 20); // shell tops the tenant up from its pool
+        assert_eq!(m.spend(&["bucket", "tenant", "root"], 40), Ok(()));
     }
 
     #[test]
-    fn a_limit_is_applied_at_the_call_site_not_from_stored_state() {
-        let mut m: BCounterMap<&str> = BCounterMap::new(1);
-        m.inc(&[("bucket", 100)], 100).unwrap();
-        // Same usage, a lower limit this call -> refused.
-        assert_eq!(
-            m.inc(&[("bucket", 100)], 1),
-            Err(("bucket", Denied { available: 0 }))
-        );
-        // Raise the limit this call -> the very same write is admitted. The limit was never
-        // baked into the merged state; it rides on the call.
-        assert_eq!(m.inc(&[("bucket", 200)], 50), Ok(()));
-        assert_eq!(m.read(&"bucket"), 150);
-        assert_eq!(m.available(&"bucket", 200), 50);
+    fn a_refund_lowers_every_level() {
+        let mut m = granted(100, 500, 9999);
+        m.spend(&["bucket", "tenant", "root"], 80).unwrap();
+        m.refund(&["bucket", "tenant", "root"], 30);
+        assert_eq!(m.global_used(&"bucket"), 50);
+        assert_eq!(m.global_used(&"tenant"), 50);
     }
 
     #[test]
     fn merge_carries_each_scope_from_both_replicas() {
-        let mut a: BCounterMap<&str> = BCounterMap::new(1);
-        let mut b: BCounterMap<&str> = BCounterMap::new(2);
-        a.inc(&[("bucket", 1000)], 300).unwrap(); // only a knows "bucket"
-        b.inc(&[("tenant", 1000)], 400).unwrap(); // only b knows "tenant"
+        let mut a: EscrowMap<&str> = EscrowMap::new(1);
+        a.grant(&"bucket", 1000);
+        a.spend(&["bucket"], 300).unwrap();
+        let mut b: EscrowMap<&str> = EscrowMap::new(2);
+        b.grant(&"tenant", 1000);
+        b.spend(&["tenant"], 400).unwrap();
         a.merge(&b);
-        assert_eq!(a.read(&"bucket"), 300); // kept
-        assert_eq!(a.read(&"tenant"), 400); // adopted
+        assert_eq!(a.global_used(&"bucket"), 300); // kept
+        assert_eq!(a.global_used(&"tenant"), 400); // adopted
     }
 
-    #[test]
-    fn merge_sums_a_shared_scope_across_nodes() {
-        let mut a: BCounterMap<&str> = BCounterMap::new(1);
-        let mut b: BCounterMap<&str> = BCounterMap::new(2);
-        a.inc(&[("root", 1000)], 300).unwrap();
-        b.inc(&[("root", 1000)], 400).unwrap();
-        a.merge(&b);
-        assert_eq!(a.read(&"root"), 700);
-    }
+    // ---- CRDT laws over the map's view -----------------------------------
 
-    // ---- CRDT laws over the map ------------------------------------------
-
-    /// A map holding usage for a single scope on one node's slot.
-    fn single_map(me: u32, scope: u8, consumed: u64, freed: u64) -> BCounterMap<u8> {
-        let mut m: BCounterMap<u8> = BCounterMap::new(me);
-        m.inc(&[(scope, u64::MAX)], consumed).unwrap();
-        m.dec(&[scope], freed);
+    fn single_map(me: u32, scope: u8, spent: u64, freed: u64) -> EscrowMap<u8> {
+        let mut m: EscrowMap<u8> = EscrowMap::new(me);
+        m.grant(&scope, u64::MAX);
+        m.spend(&[scope], spent).unwrap();
+        m.refund(&[scope], freed);
         m
     }
 
-    fn map_state() -> impl Strategy<Value = BCounterMap<u8>> {
+    fn map_state() -> impl Strategy<Value = EscrowMap<u8>> {
         (0u32..4, 0u8..4, 0u64..100_000, 0u64..100_000)
-            .prop_map(|(me, scope, consumed, freed)| single_map(me, scope, consumed, freed))
+            .prop_map(|(me, scope, spent, freed)| single_map(me, scope, spent, freed))
     }
 
-    fn merged(base: &BCounterMap<u8>, parts: &[BCounterMap<u8>]) -> BCounterMap<u8> {
+    fn merged(base: &EscrowMap<u8>, parts: &[EscrowMap<u8>]) -> EscrowMap<u8> {
         let mut acc = base.clone();
         for p in parts {
             acc.merge(p);
@@ -274,27 +254,12 @@ mod tests {
 
         #[test]
         fn map_merge_is_commutative(base in map_state(), a in map_state(), b in map_state()) {
-            prop_assert_eq!(
-                merged(&base, &[a.clone(), b.clone()]),
-                merged(&base, &[b, a])
-            );
-        }
-
-        #[test]
-        fn map_merge_is_associative(a in map_state(), b in map_state(), c in map_state()) {
-            let mut left = a.clone();
-            left.merge(&b);
-            left.merge(&c);
-            let mut bc = b;
-            bc.merge(&c);
-            let mut right = a;
-            right.merge(&bc);
-            prop_assert_eq!(left, right);
+            prop_assert_eq!(merged(&base, &[a.clone(), b.clone()]), merged(&base, &[b, a]));
         }
 
         #[test]
         fn map_all_merge_orders_converge(parts in prop::collection::vec(map_state(), 0..8)) {
-            let base: BCounterMap<u8> = BCounterMap::new(0);
+            let base: EscrowMap<u8> = EscrowMap::new(0);
             let forward = merged(&base, &parts);
             let mut reversed = parts.clone();
             reversed.reverse();
