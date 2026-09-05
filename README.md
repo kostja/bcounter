@@ -183,7 +183,7 @@ f  ≥  ─────  ·  ─────────           for ε = 0.1,
 - `f` grows as `1/Y²`. Halve the quota and you need four times the coordination. This is the
   small-quota problem in one line.
 - `f` needs the rate `Λ` and the dispersion `E[J²]`, not just the average. Heavy-tailed object
-  sizes (common in S3) raise `E[J²]` and need more frequent gossip than the average rate
+  sizes (common in S3) raise `E[J²]` and need more frequent top-ups than the average rate
   suggests. A Gaussian assumption underestimates the false denials; for the tail, use a ruin
   bound (`P(dry) ≤ e^{−R·b}`).
 - Units: `f` is `1/time`, but none of `{N, Y, ε, p}` has time in it. So you must supply a rate
