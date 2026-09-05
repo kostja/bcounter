@@ -622,26 +622,90 @@ mod tests {
     }
 
     #[test]
-    fn random_lifecycles_stay_enforced_and_agree() {
+    fn random_lifecycles_hold_invariants_every_tick() {
         // Many different random histories of down/up, join, leave, and leader change, under
-        // loss. Each must stay enforced, and its live replicas must agree at the end. With the
-        // events timed so no usage tail is lost, agreement here is also full convergence.
+        // loss. The invariants are checked on *every* tick, not just at the end.
+        use std::collections::BTreeMap;
         for seed in 0..40u64 {
-            let w = run(random_params(seed));
-            assert!(
-                w.enforcement_holds(),
-                "seed {seed}: usage exceeded the ceiling"
-            );
-            assert!(
-                w.agreed(),
-                "seed {seed}: live replicas did not agree, true_total={}",
-                w.true_total
-            );
+            let mut w = World::new(random_params(seed));
+            let mut last: BTreeMap<u32, u64> = BTreeMap::new();
+            while w.now < w.p.rounds {
+                w.step();
+                // Safety: usage never exceeds the ceiling.
+                assert!(
+                    w.true_total <= w.p.limit + w.p.delta,
+                    "seed {seed} tick {}: overshoot",
+                    w.now
+                );
+                for n in w.nodes.iter().filter(|n| n.active()) {
+                    let g = n.usage.global_used();
+                    // No phantom: a node never sees more usage than truly happened.
+                    assert!(
+                        g <= w.true_total,
+                        "seed {seed} tick {}: node {} sees {g} > true {}",
+                        w.now,
+                        n.id,
+                        w.true_total
+                    );
+                    // Monotone: a node's view never regresses (grow-only; no releases here).
+                    if let Some(&prev) = last.get(&n.id) {
+                        assert!(
+                            g >= prev,
+                            "seed {seed} tick {}: node {} regressed {prev} -> {g}",
+                            w.now,
+                            n.id
+                        );
+                    }
+                    last.insert(n.id, g);
+                }
+            }
+            // Liveness: once quiet, the live replicas agree, on the truth.
             assert!(
                 w.converged(),
-                "seed {seed}: live replicas agreed but not on the truth, true_total={}",
+                "seed {seed}: did not converge, true={}",
                 w.true_total
             );
         }
+    }
+
+    #[test]
+    fn news_reaches_every_node_within_log_m_rounds() {
+        // No loss, no churn: a fresh broadcast reaches every node in O(log M) rounds -- the
+        // eager tree is ~log M deep, with lazy GRAFT to catch stragglers.
+        let m = 16u32;
+        let mut p = base(0.0);
+        p.nodes = m;
+        p.events.clear();
+        let mut w = World::new(p);
+        for _ in 0..300 {
+            w.step();
+        }
+        assert!(w.converged(), "warm-up did not converge");
+
+        // Node 0 makes one fresh change and broadcasts it right away.
+        let i0 = w.idx(0).unwrap();
+        w.nodes[i0].usage.grant(1000);
+        w.nodes[i0].usage.acquire(777).unwrap();
+        w.true_total += 777;
+        let bytes = encode(&w.nodes[i0].usage.delta());
+        w.nodes[i0].tree.broadcast(w.now, bytes);
+        w.pump(i0);
+
+        // Count rounds until every node has it.
+        let mut rounds = 0u64;
+        while rounds < 4 * u64::from(m) {
+            w.step();
+            rounds += 1;
+            if w.converged() {
+                break;
+            }
+        }
+        assert!(w.converged(), "news did not reach every node");
+        let log_m = u64::from(32 - (m - 1).leading_zeros()); // ceil(log2 M)
+        let bound = 6 * log_m;
+        assert!(
+            rounds <= bound,
+            "news took {rounds} rounds for M={m}, over the O(log M) bound {bound}"
+        );
     }
 }
