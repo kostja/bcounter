@@ -1,0 +1,10 @@
+[package]
+name = "lease-sim"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bcounter = { path = ".." }
+plumtree-fsm = { git = "https://github.com/kostja/plumtree" }
