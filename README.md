@@ -97,7 +97,7 @@ slots with `delta()` and merge a peer's with `apply()`:
   them in your own wire format)
 - `apply(&[(node, acquired, released)])` — merge a peer's slots, per-slot max, idempotent
 
-Pair it with [`plumtree`](https://crates.io/crates/plumtree) (an epidemic-broadcast layer) and a
+Pair it with [`plumtree-fsm`](https://github.com/kostja/plumtree-fsm) (an epidemic-broadcast layer) and a
 worker fiber:
 
 1. `counter.delta()` → encode → `plumtree.broadcast(now, bytes)`

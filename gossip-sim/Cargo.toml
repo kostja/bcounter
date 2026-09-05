@@ -7,4 +7,4 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 bcounter = { path = ".." }
-plumtree = { path = "../plumtree" }
+plumtree-fsm = { git = "https://github.com/kostja/plumtree-fsm" }

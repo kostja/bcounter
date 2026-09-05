@@ -18,7 +18,7 @@
 //! Deterministic (seeded), no external dependencies. Run: `cargo run -p gossip-sim`.
 
 use bcounter::{BCounter, LocalQuota, Quota};
-use plumtree::{Action, Config, Message, Plumtree};
+use plumtree_fsm::{Action, Config, Message, Plumtree};
 
 // ---------------------------------------------------------------- rng
 
