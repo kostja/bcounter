@@ -1,90 +1,90 @@
 # bcounter
 
-An **escrow bounded counter** for distributed capacity quotas, plus a map of them for
-hierarchical (path) quotas and the allocator trait that feeds them. Pure,
-`#![forbid(unsafe_code)]`, no network, no clock. This is the escrow (reservation) design of the
-[bounded counter][balegas] of Balegas et al., descended from O'Neil's escrow transactional
-method.
+An escrow bounded counter for distributed capacity quotas, plus a map of them for hierarchical
+(path) quotas and the allocator trait that feeds them. Pure, `#![forbid(unsafe_code)]`, no
+network, no clock. This is the escrow (reservation) design of the [bounded counter][balegas] of
+Balegas et al., which descends from O'Neil's escrow transactional method.
 
 Enforce *"no more than `limit` in total"* — bytes stored, objects held, connections open —
-across a cluster where every node accepts writes, **without a round trip on the write path**.
+across a cluster where every node accepts writes, without a round trip on the write path.
 
-> **What this crate is:** the pure data structures — [`Escrow`], [`EscrowMap`] — and the
-> [`Pool`] **trait** the allocator must satisfy. The allocator/pool *implementation* lives in
-> the server embedding this (it needs durability, a clock for lease TTLs, and a rebalancing
-> policy); a minimal in-process [`LocalPool`] is provided for tests and examples. The lease,
-> Plumtree, and adaptive-gossip machinery in [The model](#the-model) marked *(planned)* describe
-> where that server is headed.
+> **What this crate is:** the data structures — [`BCounter`], [`BCounterMap`] — and the [`Quota`]
+> trait the allocator must satisfy. The allocator itself is not here. It needs durability, a
+> clock for lease expiry, and a rebalancing policy, so it belongs to the server that embeds this
+> crate. A minimal [`LocalQuota`] is included for tests and examples. The lease, Plumtree, and
+> adaptive-gossip parts of [The model](#the-model) marked *(planned)* are where that server is
+> headed.
 
 ## Data structure
 
-A **pool** owns the global budget and hands out **grants** — slices of it — to nodes. A node
-spends only against the rights it holds, purely locally, consulting no one:
+A `Quota` holds the global budget. It lends slices of it, called grants, to nodes. A node
+acquires only against the rights it holds. The check is local; it needs no view of other nodes:
 
 ```text
-  spend admitted  ⟺  net spent on this node + amount ≤ granted to this node
+  acquire admitted  ⟺  net used on this node + amount ≤ granted to this node
 ```
 
-The safety property follows from the pool's one invariant, `Σ grants ≤ limit`: since each node's
-spending is capped by its grant, `Σ spent ≤ Σ grants ≤ limit`. **The limit is never exceeded —
-no overshoot, ever** — as long as the pool honors its ceiling. The trade for that guarantee is
-the *false denial*: a node whose grant is spent must refuse a write even while unspent quota
-sits on another node, until the pool moves a grant across.
+The quota keeps one rule: `Σ grants ≤ limit`. Each node's usage is capped by its grant, so
+`Σ used ≤ Σ grants ≤ limit`. The limit is never exceeded. There is no overshoot.
 
-Each `Escrow` also carries a gossiped view of every node's spending — a grow-only CRDT merged by
-elementwise `max` (idempotent, commutative, associative; laws proven by `proptest`) — so global
-usage can be observed for metrics and for the pool's rebalancing decisions.
+The cost is the false denial. A node that has used up its grant must refuse a write, even when
+another node holds unused quota, until the quota moves a grant across.
+
+Each `BCounter` also keeps a gossiped view of every node's usage. The view is a grow-only CRDT,
+merged by taking the larger value in each slot (idempotent, commutative, associative; laws
+proven by `proptest`). It lets any node read the cluster-wide usage, for metrics and for the
+quota's rebalancing decisions.
 
 ```rust
-use bcounter::{Escrow, LocalPool, Pool};
+use bcounter::{BCounter, LocalQuota, Quota};
 
-let mut pool = LocalPool::new(100);    // a pool owning a limit of 100
-let mut a: Escrow = Escrow::new(1, 0); // node 1, no rights yet
+let mut quota = LocalQuota::new(100);      // a quota with a limit of 100
+let mut a: BCounter = BCounter::new(1, 0); // node 1, no rights yet
 
-// `draw` spends, topping up from the pool when the local grant is short.
-assert_eq!(a.draw(&mut pool, 60), Ok(())); // pool grants 60 to node 1
+// `draw` acquires, asking the quota for more when the local grant is short.
+assert_eq!(a.draw(&mut quota, 60), Ok(())); // the quota grants 60 to node 1
 assert_eq!(a.granted(), 60);
 assert_eq!(a.local_available(), 0);
 
-a.refund(25);                          // a delete returns rights locally
+a.release(25);                             // a delete returns rights locally
 assert_eq!(a.local_available(), 25);
 ```
 
-The node id is generic (`Escrow<Id>`, default `u32` — a Raft node id, a member uuid, any
+The node id is generic (`BCounter<Id>`, default `u32` — a Raft node id, a member uuid, any
 `Ord + Clone`).
 
 ### The allocator contract
 
-The pool is out of this crate, but its contract is not. Any allocator implements [`Pool`]:
+The quota is not in this crate, but its contract is. Any allocator implements [`Quota`]:
 
 ```rust
-pub trait Pool<Id> {
+pub trait Quota<Id> {
     fn grant(&mut self, who: &Id, want: u64) -> u64; // lend up to `want`; Σ grants ≤ ceiling
-    fn release(&mut self, who: &Id, amount: u64);    // take unused rights back
+    fn reclaim(&mut self, who: &Id, amount: u64);    // take unused rights back
     fn available(&self) -> u64;                      // rights free to lend
 }
 ```
 
-Honor `Σ outstanding grants ≤ limit + Δ` and the escrow counters it feeds can never exceed
-`limit + Δ` (`Δ = 0` for strict, overshoot-free enforcement; `Δ > 0` trades a bounded overshoot
-for fewer false denials). Durability across leader changes, lease TTLs, and rebalancing policy
-are the implementor's — expected to be the server.
+Keep `Σ grants ≤ limit + Δ`, and the counters it feeds can never exceed `limit + Δ`. `Δ = 0`
+gives strict, overshoot-free enforcement. `Δ > 0` allows an overshoot of at most `Δ` in exchange
+for fewer false denials. Durability across leader changes, lease expiry, and rebalancing are the
+implementor's job, and the implementor is the server.
 
 ### Hierarchical quotas
 
-[`EscrowMap`] holds one `Escrow` per scope. A single write is subject to several limits at once
-— bucket, tenant, root — so it spends across the whole path **all-or-none**: every level is
-checked before any is charged. Spending is purely local against each scope's granted rights; a
-short scope is named back to the caller, which tops it up from that scope's pool and retries.
+`BCounterMap` holds one `BCounter` per scope. A single write is subject to several limits at once
+— bucket, tenant, root — so it charges the whole path all-or-none: every level is checked before
+any is charged. Charging is local, against each scope's granted rights. When a scope is short,
+the map names it and charges nothing; the server tops it up from that scope's quota and retries.
 
 ```rust
-use bcounter::EscrowMap;
+use bcounter::BCounterMap;
 
-let mut m: EscrowMap<&str> = EscrowMap::new(1);
-m.grant(&"bucket", 100);            // rights the server drew from each scope's pool
+let mut m: BCounterMap<&str> = BCounterMap::new(1);
+m.grant(&"bucket", 100);            // rights the server drew from each scope's quota
 m.grant(&"tenant", 500);
 m.grant(&"root", 9999);
-assert_eq!(m.spend(&["bucket", "tenant", "root"], 40), Ok(()));
+assert_eq!(m.acquire(&["bucket", "tenant", "root"], 40), Ok(()));
 assert_eq!(m.global_used(&"tenant"), 40);
 ```
 
@@ -92,30 +92,30 @@ assert_eq!(m.global_used(&"tenant"), 40);
 
 ## The model
 
-Enforcing a global limit while every node admits writes locally means giving up *something* —
-the only question is what, and how much. This section is the analysis behind the design.
+To enforce a global limit while every node admits writes locally, you have to give something up.
+The question is what, and how much. This section is the analysis behind the design.
 
-### The two errors are dual
+### Two errors, and you have to pick
 
-- **Overshoot** — admitting past the limit `Y`. An *optimistic* counter's error (spend against a
-  stale global view; self-correcting but unbounded up to `(N−1)·Y`).
-- **False denial** — refusing a write while global quota still exists. The *escrow* counter's
-  error, and this crate's: a node's grant runs dry while quota sits elsewhere.
+- **Overshoot:** admitting past the limit `Y`. This is an optimistic counter's error. It spends
+  against a stale global view, corrects itself after the next gossip, but can go up to `(N−1)·Y`
+  before it does.
+- **False denial:** refusing a write while global quota still exists. This is the escrow
+  counter's error, and this crate's. A node's grant runs dry while quota sits on another node.
 
-You cannot drive both to zero without coordinating on every write (the round trip we refuse to
-pay). Escrow fixes overshoot at zero and pays in false denials; the `Δ` allowance and gossip
-frequency slide along the single knob between the two.
+You cannot make both zero without coordinating on every write, which is the round trip we avoid.
+Escrow makes overshoot zero and pays in false denials. Two things reduce the false denials: a
+larger `Δ` (overshoot allowance) and more frequent gossip.
 
 ### Escrow as an inventory problem
 
-Treat a node's grant as **inventory**, consumption as **demand**, a pool top-up as
-**replenishment**. Running dry = stockout = false denial. This is the (s,S) replenishment
-problem and its ruin-theory cousin.
+A node's grant is like inventory. Consumption is demand. A top-up from the quota is a resupply.
+Running out is a stockout, which here is a false denial. This is the standard (s,S) inventory
+problem.
 
 Model node *i*'s consumption as a compound process: events at rate `λᵢ`, sizes with second
-moment `E[J²]`. Over a replenishment interval `τ = 1/f`, consumption has mean `λᵢ·E[J]·τ` and
-variance `λᵢ·E[J²]·τ`. To hold this node's false-denial probability under `p`, its grant must
-cover
+moment `E[J²]`. Over a top-up interval `τ = 1/f`, consumption has mean `λᵢ·E[J]·τ` and variance
+`λᵢ·E[J²]·τ`. To keep this node's false-denial probability under `p`, its grant must cover:
 
 ```
 gᵢ(τ)  ≥  λᵢ·E[J]·τ   +   z_p · √( λᵢ·E[J²]·τ )        z_p = Φ⁻¹(1 − p)
@@ -124,19 +124,19 @@ gᵢ(τ)  ≥  λᵢ·E[J]·τ   +   z_p · √( λᵢ·E[J²]·τ )        z_p 
 
 subject to `Σ gᵢ ≤ Y`.
 
-### The √N risk-pooling penalty
+### The √N cost of decentralizing
 
-Summing safety stock over `N` nodes, decentralized escrow needs total slack
-`z_p·Σ√(λᵢ E[J²] τ)`; a central counter coordinating per write needs only
-`z_p·√(Σ λᵢ E[J²] τ)`. For homogeneous nodes the ratio is **√N** — distributing the quota
-multiplies the required margin by √N. That is the price of no round trip, and it is why small
-quotas on large clusters are hard.
+Add up the safety stock over `N` nodes. Decentralized escrow needs total slack
+`z_p·Σ√(λᵢ E[J²] τ)`. A central counter that coordinates on every write needs only
+`z_p·√(Σ λᵢ E[J²] τ)`. For equal nodes the ratio is √N. Splitting the quota across `N` nodes
+multiplies the required safety margin by √N. This is the cost of avoiding the round trip, and it
+is why small quotas on large clusters are hard.
 
 ### The frequency law
 
-Aggregate consumption over one interval has std `σ_C = √(Λ·E[J²]·τ)`, `Λ = Σλᵢ`. Requiring the
-fluctuation within a fraction `ε` of `Y` at confidence `z` gives the minimum replenishment
-frequency:
+Aggregate consumption over one interval has standard deviation `σ_C = √(Λ·E[J²]·τ)`, with
+`Λ = Σλᵢ`. To keep the fluctuation within a fraction `ε` of `Y` at confidence `z`, the minimum
+top-up frequency is:
 
 ```
         z²      Λ · E[J²]
@@ -144,60 +144,65 @@ f  ≥  ─────  ·  ─────────           for ε = 0.1,
        ε²          Y²
 ```
 
-- `f ∝ 1/Y²` — halve the quota, quadruple the coordination. The sharp form of the small-quota
-  wall.
-- `f` needs the **rate** `Λ` *and* the **dispersion** `E[J²]`, not the mean alone. Heavy-tailed
-  object sizes (S3's reality) inflate `E[J²]`; Gaussian assumptions understate false denials, so
-  use a Lundberg / ruin bound (`P(dry) ≤ e^{−R·b}`) for the tail.
-- **Dimensions:** `f` is `1/time`, and none of `{N, Y, ε, p}` carries time — so you must supply a
-  rate `Λ` (or a fill horizon `T = Y/Λ`). Admins usually know it ("~1 TB/day"); make it an input.
+- `f` grows as `1/Y²`. Halve the quota and you need four times the coordination. This is the
+  small-quota problem in one line.
+- `f` needs the rate `Λ` and the dispersion `E[J²]`, not just the average. Heavy-tailed object
+  sizes (common in S3) raise `E[J²]` and need more frequent gossip than the average rate
+  suggests. A Gaussian assumption underestimates the false denials; for the tail, use a ruin
+  bound (`P(dry) ≤ e^{−R·b}`).
+- Units: `f` is `1/time`, but none of `{N, Y, ε, p}` has time in it. So you must supply a rate
+  `Λ`, or a fill horizon `T = Y/Λ`. An admin usually knows one of these ("about 1 TB per day").
+  Make it an input.
 
-### Feasibility gate and the minimum enforceable quota *(planned)*
+### Feasibility check and the smallest enforceable quota *(planned)*
 
-Replenishing faster than some `f_max` (~10 Hz per hot counter is a sane default) is infeasible.
-Inverting the law at `f_max` gives a smallest enforceable quota:
+Topping up faster than some `f_max` is not practical (about 10 Hz per hot counter is a reasonable
+default). Solve the frequency law for `Y` at `f_max`:
 
 ```
 Y_min  =  (z / ε) · √( Λ · E[J²] / f_max )
 ```
 
-A quota below `Y_min` for its workload is **refused at configuration time** — diagnostically,
-offering three levers: raise `Y`, loosen the target (report the tightest band achievable at
-`f_max`), or accept it as a soft/best-effort limit. `f_max` is per *hot* counter; the sparse map
-keeps only a handful near-full-and-active, and their deltas batch into one gossip message.
+If a quota is below `Y_min` for its workload, refuse it when it is configured, rather than
+enforce it badly. Report the three options: raise `Y`, loosen the target (show the tightest band
+reachable at `f_max`), or accept a soft, best-effort limit. `f_max` is per hot counter. The map
+is sparse, so only a few counters are near full and busy at once, and their deltas fit in one
+gossip message.
 
 ### Enforcement architecture *(planned)*
 
-`Escrow` + `Pool` are the mechanism; the server adds the policy:
+`BCounter` and `Quota` are the mechanism. The server adds the policy:
 
-- **Hierarchical leases over a broadcast tree.** A [Plumtree][plumtree] tree, seeded from Raft
-  membership and repaired by lazy-push, carries grants: the root owns the pool, each parent
-  sub-leases to its subtree. Hierarchy cuts the √N penalty to per-level fan-out and localizes
-  the high-frequency need to the busiest link (the root).
-- **Fenced, TTL'd leases.** A holder self-expires *before* the grantor reclaims (a clock-skew
-  margin), so expiry never double-allocates. TTL ≥ tree-repair time reclaims a dead subtree's
-  grant; the outstanding-grant ledger is Raft-durable so a leader change never re-lends budget.
-- **Static operating point + event-triggered correction.** Pick a conservative point offline
-  (e.g. lease ≈ the fair share, assume ~50% utilization for a cooperative user), replenish at
-  the cadence the frequency law prescribes, and let a node whose lease depletes ahead of schedule
-  trigger an early top-up. Feedback only on the exception path — not a continuous loop.
+- **Hierarchical leases over a broadcast tree.** A [Plumtree][plumtree] tree, built from the Raft
+  membership and repaired by lazy-push, carries the grants. The root owns the quota; each parent
+  sub-lends to its subtree. The tree cuts the √N cost to per-level fan-out, and puts the
+  high-frequency work on the busiest link, the root.
+- **Fenced, expiring leases.** A lease holder gives up its grant a little before the grantor
+  takes it back, so a take-back never double-lends (which would overshoot). A lease TTL longer
+  than the tree-repair time reclaims a dead subtree's grant on its own. The ledger of outstanding
+  grants is Raft-durable, so a leader change never re-lends budget.
+- **A fixed operating point with event-triggered correction.** Pick a conservative point offline
+  (for example, a lease of about the fair share, assuming about 50% use by a cooperative user).
+  Top up at the cadence the frequency law gives. When a node's lease runs low ahead of schedule,
+  it triggers an early top-up. There is no continuous control loop; feedback happens only on that
+  exception.
 
 ### Threat model
 
-These quotas are **capacity planning for cooperative users**, not a security boundary. The `Δ`
-slack (and any soft-limit fallback) is exploitable by a user who deliberately fans writes across
-nodes. A quota that must be a hard billing/abuse limit routes to the tight path (per-write
-coordination on the near-full counter) — a separate class, named explicitly.
+These quotas are for capacity planning with cooperative users. They are not a security boundary.
+The `Δ` slack, and any soft-limit fallback, can be abused by a user who spreads writes across
+nodes on purpose. A quota that must be a hard billing or abuse limit uses the tight path instead:
+coordinate per write on the counter that is near full. That is a separate case, and worth naming.
 
 ## Scope
 
-**Implemented:** the escrow `Escrow` and `EscrowMap`, the `Pool` trait, and a reference
-`LocalPool`. **Planned (in the server):** the durable, lease-based, TTL-fenced pool; the Plumtree
-broadcast tree; the adaptive-gossip / feasibility (`Y_min`) layer; a rate/bandwidth variant; and
-delta-encoded gossip. The `sim/` crate is a discrete-event simulator that drives the real
-`Escrow` and measures overshoot and false-denial against the formulas above — so the constants
-ship measured, not asserted. It confirms overshoot is exactly zero at `Δ = 0` and never exceeds
-`Δ`, and that false denials fall with a finer lease or a larger `Δ`.
+Implemented: `BCounter`, `BCounterMap`, the `Quota` trait, and the reference `LocalQuota`.
+Planned (in the server): the durable, lease-based, expiring quota; the Plumtree broadcast tree;
+the feasibility check (`Y_min`) and adaptive gossip; a rate/bandwidth variant; and delta-encoded
+gossip. The `sim/` crate is a discrete-event simulator that drives the real `BCounter` and
+measures overshoot and false denial against the formulas above. It confirms overshoot is exactly
+zero at `Δ = 0` and at most `Δ` otherwise, and that false denials fall with a finer lease or a
+larger `Δ`.
 
 ## References
 

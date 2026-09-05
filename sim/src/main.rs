@@ -3,8 +3,8 @@
 
 //! Discrete-event simulator for the `bcounter` escrow model.
 //!
-//! It drives the real [`bcounter::Escrow`] across `N` nodes drawing from one central
-//! [`bcounter::LocalPool`] with ceiling `Y + Δ`. Each node consumes quota as a compound-Poisson
+//! It drives the real [`bcounter::BCounter`] across `N` nodes drawing from one central
+//! [`bcounter::LocalQuota`] with ceiling `Y + Δ`. Each node consumes quota as a compound-Poisson
 //! stream (events at rate `lambda`, sizes heavy-tailed lognormal), drawing a lease `chunk` of
 //! rights when its local grant runs short. It measures:
 //!
@@ -15,14 +15,14 @@
 //!     (less stranded per lease) or an overshoot allowance `Δ`.
 //!
 //! The two headline sweeps vary the chunk (at `Δ = 0`) and `Δ` (at a fixed chunk). A periodic
-//! rebalance -- nodes returning unused rights to the pool -- is also wired (`rebalance_hz`), but
-//! returning *all* unused rights simply churns the central pool without cutting false denials,
+//! rebalance -- nodes returning unused rights to the quota -- is also wired (`rebalance_hz`), but
+//! returning *all* unused rights simply churns the central quota without cutting false denials,
 //! so it is left out of the headline; a smarter idle→busy transfer is future work.
 //!
 //! Deterministic (seeded), no external dependencies, no wall clock. Run: `cargo run -p
 //! bcounter-sim`.
 
-use bcounter::{Escrow, LocalPool, Pool};
+use bcounter::{BCounter, LocalQuota, Quota};
 
 /// SplitMix64 — a tiny, deterministic PRNG. Enough for a simulator; not for cryptography.
 struct Rng {
@@ -74,9 +74,9 @@ struct Params {
     nodes: u32,
     /// The global limit `Y`.
     limit: u64,
-    /// Overshoot allowance: the pool's ceiling is `limit + delta`.
+    /// Overshoot allowance: the quota's ceiling is `limit + delta`.
     delta: u64,
-    /// Rights a node draws from the pool in one top-up (its lease chunk).
+    /// Rights a node draws from the quota in one top-up (its lease chunk).
     chunk: u64,
     /// Per-node write rate (writes/sec).
     lambda: f64,
@@ -84,7 +84,7 @@ struct Params {
     size_mean: f64,
     /// Coefficient of variation of write size.
     size_cv: f64,
-    /// Rebalance frequency (Hz): how often each node returns unused rights to the pool. `0` =
+    /// Rebalance frequency (Hz): how often each node returns unused rights to the quota. `0` =
     /// never.
     rebalance_hz: f64,
     /// How long to run, in seconds.
@@ -107,11 +107,11 @@ struct Outcome {
     false_denials: u64,
 }
 
-/// Run one simulation, driving the real `Escrow` on every node against a shared `LocalPool`.
+/// Run one simulation, driving the real `BCounter` on every node against a shared `LocalQuota`.
 fn run(p: &Params) -> Outcome {
     let mut rng = Rng::new(p.seed);
-    let mut pool = LocalPool::new(p.limit + p.delta);
-    let mut nodes: Vec<Escrow> = (0..p.nodes).map(|id| Escrow::new(id, 0)).collect();
+    let mut quota = LocalQuota::new(p.limit + p.delta);
+    let mut nodes: Vec<BCounter> = (0..p.nodes).map(|id| BCounter::new(id, 0)).collect();
 
     let mut next_write: Vec<f64> = (0..p.nodes as usize).map(|_| rng.exp(p.lambda)).collect();
     let rebalance_tau = if p.rebalance_hz > 0.0 {
@@ -140,12 +140,12 @@ fn run(p: &Params) -> Outcome {
         }
 
         if next_rebalance <= soonest_write {
-            // Rebalance: every node returns all its unused rights to the pool, so quota
+            // Rebalance: every node returns all its unused rights to the quota, so quota
             // stranded in idle leases can be re-lent to busy nodes.
             for (id, node) in nodes.iter_mut().enumerate() {
                 let unused = node.local_available();
                 let returned = node.reclaim(unused);
-                pool.release(&(id as u32), returned);
+                quota.reclaim(&(id as u32), returned);
             }
             next_rebalance += rebalance_tau;
         } else {
@@ -155,10 +155,10 @@ fn run(p: &Params) -> Outcome {
             // Draw a lease chunk when short (never fewer than the shortfall).
             if node.local_available() < amount {
                 let want = p.chunk.max(amount - node.local_available());
-                let got = pool.grant(&(soonest_node as u32), want);
+                let got = quota.grant(&(soonest_node as u32), want);
                 node.grant(got);
             }
-            match node.spend(amount) {
+            match node.acquire(amount) {
                 Ok(()) => {
                     admitted += 1;
                     true_total += amount;
@@ -233,7 +233,7 @@ fn main() {
     let reps = 200u64;
     let fair = base.limit / u64::from(base.nodes); // Y/N
 
-    println!("bcounter escrow simulation (real Escrow + central LocalPool)");
+    println!("bcounter escrow simulation (real BCounter + central LocalQuota)");
     println!(
         "  N={} nodes, Y={} units, fair share Y/N={}, cluster rate≈{:.0}/s, size cv={}, {} reps\n",
         base.nodes,
@@ -245,8 +245,8 @@ fn main() {
     );
 
     println!(
-        "  (1) strict escrow (Δ=0): overshoot is always exactly zero; a smaller lease chunk\n  \
-         strands less quota, so false denials fall (the escrow analog of syncing more often)"
+        "  (1) strict escrow (Δ=0): overshoot is always exactly zero. A smaller lease chunk\n  \
+         strands less quota, so false denials fall."
     );
     println!(
         "  {:>14}  {:>12}  {:>12}  {:>14}",
@@ -287,10 +287,9 @@ fn main() {
     }
 
     println!(
-        "\n  Read: at Δ=0 overshoot is exactly 0 whatever the chunk (escrow's guarantee, the mirror\n  \
-         image of the optimistic counter). False denials fall two ways — a finer lease chunk, or\n  \
-         an overshoot allowance Δ — the two faces of the one accuracy/false-positive knob. With Δ\n  \
-         the overshoot never exceeds Δ."
+        "\n  Read: at Δ=0 the overshoot is exactly 0 at every chunk size. This is escrow's\n  \
+         guarantee. False denials fall in two ways: a finer lease chunk, or a larger Δ. With Δ,\n  \
+         the overshoot is at most Δ."
     );
 }
 
