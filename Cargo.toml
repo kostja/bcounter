@@ -1,3 +1,6 @@
+[workspace]
+members = ["sim"]
+
 [package]
 name = "bcounter"
 version = "0.1.1"
@@ -12,6 +15,7 @@ readme = "README.md"
 keywords = ["crdt", "counter", "quota", "distributed", "bounded"]
 categories = ["data-structures", "concurrency"]
 authors = ["Konstantin Osipov <kostja.osipov@gmail.com>"]
+exclude = ["sim"]
 
 [dependencies]
 
