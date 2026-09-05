@@ -227,6 +227,32 @@ impl<Id: Ord + Clone> BCounter<Id> {
             mine.released = mine.released.max(their.released);
         }
     }
+
+    /// Export the slots as plain tuples `(node, acquired, released)`, for a gossip layer to send.
+    /// A first version returns every slot; a later one can return only those changed since the
+    /// last call. This mentions no bytes and no transport: the caller encodes the tuples in its
+    /// own wire format, ships them, and the peer feeds them to [`apply`](BCounter::apply). It is
+    /// the only thing a counter has to expose to be gossiped -- `merge` cannot reach across the
+    /// wire because a peer's `BCounter` cannot be rebuilt from nothing.
+    #[must_use]
+    pub fn delta(&self) -> Vec<(Id, u64, u64)> {
+        self.slots
+            .iter()
+            .map(|(id, s)| (id.clone(), s.acquired, s.released))
+            .collect()
+    }
+
+    /// Merge the slots a peer exported with [`delta`](BCounter::delta). Per slot, the larger
+    /// `acquired` and the larger `released` win -- the same rule as [`merge`](BCounter::merge).
+    /// Idempotent, so a delta may arrive more than once. `me` and `granted` are local and are not
+    /// changed.
+    pub fn apply(&mut self, delta: &[(Id, u64, u64)]) {
+        for (id, acquired, released) in delta {
+            let mine = self.slots.entry(id.clone()).or_default();
+            mine.acquired = mine.acquired.max(*acquired);
+            mine.released = mine.released.max(*released);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +396,28 @@ mod tests {
             let mut reversed = parts.clone();
             reversed.reverse();
             prop_assert_eq!(forward, merge_all(&base, &reversed));
+        }
+
+        /// Gossiping a delta gives the same result as merging the whole counter -- so the wire
+        /// path (`delta` on one node, `apply` on another) converges like `merge` does.
+        #[test]
+        fn apply_of_a_delta_equals_merge(base in view(), other in view()) {
+            let mut merged = base.clone();
+            merged.merge(&other);
+            let mut applied = base;
+            applied.apply(&other.delta());
+            prop_assert_eq!(applied, merged);
+        }
+
+        /// Applying the same delta twice changes nothing after the first.
+        #[test]
+        fn apply_is_idempotent(base in view(), other in view()) {
+            let d = other.delta();
+            let mut once = base.clone();
+            once.apply(&d);
+            let mut twice = once.clone();
+            twice.apply(&d);
+            prop_assert_eq!(once, twice);
         }
 
         /// The safety property: with total grants capped, cluster usage never exceeds the cap,

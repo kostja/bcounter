@@ -143,6 +143,31 @@ impl<K: Ord + Clone, Id: Ord + Clone> BCounterMap<K, Id> {
                 .merge(their);
         }
     }
+
+    /// Export every scope's slots as plain tuples `(scope, node, acquired, released)`, for a
+    /// gossip layer to send. See [`BCounter::delta`]; this is the same, tagged by scope.
+    #[must_use]
+    pub fn delta(&self) -> Vec<(K, Id, u64, u64)> {
+        let mut out = Vec::new();
+        for (scope, counter) in &self.counters {
+            for (id, acquired, released) in counter.delta() {
+                out.push((scope.clone(), id, acquired, released));
+            }
+        }
+        out
+    }
+
+    /// Merge the tuples a peer exported with [`delta`](BCounterMap::delta), routing each to its
+    /// scope. Idempotent; local grants are not changed.
+    pub fn apply(&mut self, delta: &[(K, Id, u64, u64)]) {
+        let me = self.me.clone();
+        for (scope, id, acquired, released) in delta {
+            self.counters
+                .entry(scope.clone())
+                .or_insert_with(|| BCounter::new(me.clone(), 0))
+                .apply(&[(id.clone(), *acquired, *released)]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +248,19 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.global_used(&"bucket"), 300); // kept
         assert_eq!(a.global_used(&"tenant"), 400); // adopted
+    }
+
+    #[test]
+    fn delta_and_apply_carry_the_map_over_the_wire() {
+        let mut a: BCounterMap<&str> = BCounterMap::new(1);
+        a.grant(&"bucket", 1000);
+        a.grant(&"tenant", 1000);
+        a.acquire(&["bucket", "tenant"], 300).unwrap();
+        // A fresh replica rebuilds a's view from the exported tuples alone.
+        let mut b: BCounterMap<&str> = BCounterMap::new(2);
+        b.apply(&a.delta());
+        assert_eq!(b.global_used(&"bucket"), 300);
+        assert_eq!(b.global_used(&"tenant"), 300);
     }
 
     // ---- CRDT laws over the map's view -----------------------------------
