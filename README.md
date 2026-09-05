@@ -180,8 +180,7 @@ f  ≥  ─────  ·  ─────────           for ε = 0.1,
        ε²          Y²
 ```
 
-- `f` grows as `1/Y²`. Halve the quota and you need four times the coordination. This is the
-  small-quota problem in one line.
+- `f` grows as `1/Y²`. Halve the quota and you need four times the coordination.
 - `f` needs the rate `Λ` and the dispersion `E[J²]`, not just the average. Heavy-tailed object
   sizes (common in S3) raise `E[J²]` and need more frequent top-ups than the average rate
   suggests. A Gaussian assumption underestimates the false denials; for the tail, use a ruin
