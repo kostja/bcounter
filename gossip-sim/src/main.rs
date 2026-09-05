@@ -273,6 +273,12 @@ impl World {
                     if let Some(i) = self.idx(id) {
                         self.nodes[i].up = false;
                     }
+                    // Peers set the down node aside so their trees route around it.
+                    for n in &mut self.nodes {
+                        if n.active() && n.id != id {
+                            n.tree.down(&[id]);
+                        }
+                    }
                     if self.governor == id {
                         self.governor = self.next_active_after(id);
                     }
@@ -280,6 +286,11 @@ impl World {
                 Event::Up(id) => {
                     if let Some(i) = self.idx(id) {
                         self.nodes[i].up = true;
+                    }
+                    for n in &mut self.nodes {
+                        if n.active() && n.id != id {
+                            n.tree.up(&[id]);
+                        }
                     }
                 }
                 Event::Leave(id) => {
@@ -341,6 +352,21 @@ impl World {
             .iter()
             .filter(|n| n.active())
             .all(|n| n.usage.global_used() == self.true_total)
+    }
+
+    /// Every reachable member agrees with every other -- strong eventual consistency. Weaker
+    /// than `converged`: it does not require the agreed value to equal the truth, only that the
+    /// live replicas hold the same value.
+    fn agreed(&self) -> bool {
+        let mut vals = self
+            .nodes
+            .iter()
+            .filter(|n| n.active())
+            .map(|n| n.usage.global_used());
+        match vals.next() {
+            Some(first) => vals.all(|v| v == first),
+            None => true,
+        }
     }
 
     fn run_to_end(&mut self) {
@@ -407,6 +433,58 @@ fn lifecycle(loss: f64) -> Params {
     }
 }
 
+/// A long, random timeline of events: nodes flap down and back up, some leave, some join, and
+/// the leader changes -- all at random rounds, with a quiet tail so the run settles. The events
+/// are timed to stay convergent: every downed node returns before the quiet tail (its own slot
+/// keeps its full usage and re-gossips it), and leaves happen in the quiet phase after the
+/// leaver's final usage has spread. `flappers` and `leavers` are disjoint sets of nodes.
+fn random_params(seed: u64) -> Params {
+    let mut rng = Rng::new(seed ^ 0x5EED_1234);
+    let n = 16u32;
+    let load_until = 200u64;
+    let rounds = 800u64;
+    let settle_from = rounds - 200; // no events after this; everything is up
+
+    let mut ids: Vec<u32> = (0..n).collect();
+    for i in (1..ids.len()).rev() {
+        ids.swap(i, rng.below(i + 1));
+    }
+    let flappers: Vec<u32> = ids[0..3 + rng.below(3)].to_vec(); // 3..5 nodes flap
+    let leavers: Vec<u32> = ids[8..8 + rng.below(3)].to_vec(); // 0..2 nodes leave (disjoint)
+
+    let mut events: Vec<(u64, Event)> = Vec::new();
+    for f in flappers {
+        let down_at = 40 + rng.below((settle_from - 120) as usize) as u64;
+        let up_at = (down_at + 20 + rng.below(60) as u64).min(settle_from - 10);
+        events.push((down_at, Event::Down(f)));
+        events.push((up_at, Event::Up(f)));
+    }
+    for l in leavers {
+        let at = load_until + 40 + rng.below((settle_from - load_until - 60) as usize) as u64;
+        events.push((at, Event::Leave(l)));
+    }
+    for _ in 0..1 + rng.below(4) {
+        events.push((
+            30 + rng.below((settle_from - 60) as usize) as u64,
+            Event::Governor,
+        ));
+    }
+    for _ in 0..rng.below(3) {
+        events.push((
+            30 + rng.below((load_until + 100) as usize) as u64,
+            Event::Join,
+        ));
+    }
+
+    Params {
+        nodes: n,
+        load_until,
+        rounds,
+        events,
+        ..base(0.1)
+    }
+}
+
 fn main() {
     println!("bcounter + plumtree over a surrogate network (16 nodes, quota Y=1_000_000)");
     println!("  load runs to round 200, then quiet rounds; gossip carries full state\n");
@@ -447,6 +525,21 @@ fn main() {
             );
         }
     }
+    println!(
+        "\n  random lifecycles (each a different history of down/up, join, leave, leader change):"
+    );
+    for seed in 0..6u64 {
+        let mut w = World::new(random_params(seed));
+        w.run_to_end();
+        println!(
+            "  {:>8}  enforced={:<4}  agreed={:<4}  converged={:<4}",
+            format!("seed {seed}"),
+            yesno(w.enforcement_holds()),
+            yesno(w.agreed()),
+            yesno(w.converged()),
+        );
+    }
+
     println!(
         "\n  Read: usage stays within the quota (enforced), and every reachable member's view\n  \
          converges to the true total -- through 30% message loss and a full lifecycle of leader\n  \
@@ -523,6 +616,30 @@ mod tests {
             assert!(
                 w.converged(),
                 "lifecycle did not converge at {loss} loss: true_total={}",
+                w.true_total
+            );
+        }
+    }
+
+    #[test]
+    fn random_lifecycles_stay_enforced_and_agree() {
+        // Many different random histories of down/up, join, leave, and leader change, under
+        // loss. Each must stay enforced, and its live replicas must agree at the end. With the
+        // events timed so no usage tail is lost, agreement here is also full convergence.
+        for seed in 0..40u64 {
+            let w = run(random_params(seed));
+            assert!(
+                w.enforcement_holds(),
+                "seed {seed}: usage exceeded the ceiling"
+            );
+            assert!(
+                w.agreed(),
+                "seed {seed}: live replicas did not agree, true_total={}",
+                w.true_total
+            );
+            assert!(
+                w.converged(),
+                "seed {seed}: live replicas agreed but not on the truth, true_total={}",
                 w.true_total
             );
         }

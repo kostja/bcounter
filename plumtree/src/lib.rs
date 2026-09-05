@@ -8,7 +8,7 @@
 //! with gossip-level resilience.
 //!
 //! This crate is the algorithm only. It reads no clock and no socket. See [the contract](#the-
-//! contract) for how you drive it, and [membership and the root](#membership-and-the-root) for
+//! contract) for how you drive it, and [membership and liveness](#membership-and-liveness) for
 //! what to do when the cluster changes.
 //!
 //! # Papers
@@ -39,13 +39,23 @@
 //! call `apply`; to originate, call `broadcast` with an encoded `delta`. Neither library knows
 //! about the other.
 //!
-//! # Membership and the root
+//! # Membership and liveness
 //!
-//! Call [`membership`](Plumtree::membership) when the cluster changes. A node that **joins**
-//! starts lazy and is pulled into the tree by the first message it sends or receives. A node
-//! that **leaves** is dropped from both peer sets and from any in-progress recovery, and any
-//! queued `Send` to it is removed from the outbound queue — so you never send to a peer that is
-//! gone.
+//! Two different things change the peer set, and they are separate calls:
+//!
+//! - [`membership`](Plumtree::membership) — a node **joined** the cluster or **left for good**. A
+//!   joined node starts lazy and is grafted into the tree by its first message. A left node is
+//!   forgotten entirely. Drive this from the cluster's membership record (from Raft).
+//! - [`down`](Plumtree::down) / [`up`](Plumtree::up) — a member became **unreachable** or
+//!   **reachable** again. A down node is set aside, so the tree routes around it, but it is kept
+//!   and returns on `up` (or as soon as a message from it arrives, which proves it is
+//!   reachable). Drive this from a failure detector.
+//!
+//! The two are not the same: removal expels a node; down only sets it aside while it is
+//! unreachable. In both cases, any queued `Send` to an excluded node is dropped, so you never
+//! send to a peer that is gone or unreachable.
+//!
+//! # The root
 //!
 //! Plumtree has **no single root**. Each broadcast spreads from its own source over the shared
 //! eager/lazy mesh, so a Raft leader or governor change does not touch this overlay: there is
@@ -147,6 +157,9 @@ pub struct Plumtree<Id: Ord + Clone> {
     me: Id,
     eager: BTreeSet<Id>,
     lazy: BTreeSet<Id>,
+    /// Members currently unreachable: kept as known peers, but excluded from the tree so it
+    /// routes around them. Distinct from a removed peer, which is forgotten entirely.
+    down: BTreeSet<Id>,
     seq: u64,
     cache: BTreeMap<MsgId<Id>, Vec<u8>>,
     cache_order: VecDeque<MsgId<Id>>,
@@ -171,6 +184,7 @@ impl<Id: Ord + Clone> Plumtree<Id> {
             me,
             eager: eager.into_iter().collect(),
             lazy: lazy.into_iter().collect(),
+            down: BTreeSet::new(),
             seq: 0,
             cache: BTreeMap::new(),
             cache_order: VecDeque::new(),
@@ -292,9 +306,26 @@ impl<Id: Ord + Clone> Plumtree<Id> {
 
     fn graft_in(&mut self, peer: &Id) {
         if *peer != self.me {
+            // A message from a peer proves it is reachable, so it also clears any `down` mark.
+            self.down.remove(peer);
             self.lazy.remove(peer);
             self.eager.insert(peer.clone());
         }
+    }
+
+    /// Drop `peers` from the tree and from pending recovery, and remove any queued Send to them.
+    fn exclude(&mut self, peers: &[Id]) {
+        for p in peers {
+            self.eager.remove(p);
+            self.lazy.remove(p);
+            for m in self.missing.values_mut() {
+                m.announcers.retain(|a| a != p);
+            }
+        }
+        self.outbound.retain(|a| match a {
+            Action::Send(peer, _) => !peers.contains(peer),
+            Action::Deliver(_) => true,
+        });
     }
 
     fn move_to_lazy(&mut self, peer: &Id) {
@@ -336,27 +367,49 @@ impl<Id: Ord + Clone> Plumtree<Id> {
         }
     }
 
-    /// Update membership. New peers start lazy and are grafted into the tree by the next message.
-    /// Departed peers are dropped from both sets and from any pending recovery, and any queued
-    /// `Send` to a departed peer is removed from the outbound queue.
+    /// Change the cluster's membership: `added` nodes have joined, `removed` nodes have left for
+    /// good. A joined node starts lazy and is grafted into the tree by the first message it
+    /// exchanges. A removed node is **forgotten entirely** -- dropped from every set and from any
+    /// pending recovery, and any queued `Send` to it is removed.
+    ///
+    /// This is not the same as [`down`](Plumtree::down)/[`up`](Plumtree::up): removal expels a
+    /// node, while down only sets it aside while it is unreachable.
     pub fn membership(&mut self, added: &[Id], removed: &[Id]) {
         for p in added {
-            if *p != self.me && !self.eager.contains(p) {
+            let known = self.eager.contains(p) || self.lazy.contains(p) || self.down.contains(p);
+            if *p != self.me && !known {
                 self.lazy.insert(p.clone());
             }
         }
-        for p in removed {
-            self.eager.remove(p);
-            self.lazy.remove(p);
-            for m in self.missing.values_mut() {
-                m.announcers.retain(|a| a != p);
+        if !removed.is_empty() {
+            self.exclude(removed);
+            for p in removed {
+                self.down.remove(p);
             }
         }
-        if !removed.is_empty() {
-            self.outbound.retain(|a| match a {
-                Action::Send(peer, _) => !removed.contains(peer),
-                Action::Deliver(_) => true,
-            });
+    }
+
+    /// Mark `peers` unreachable. They stay members but are set aside: excluded from the tree so
+    /// it routes around them, with any queued `Send` to them dropped. Use this when a failure
+    /// detector reports a node down. A later [`up`](Plumtree::up) restores them; so does any
+    /// message received from one, which proves it is reachable again.
+    pub fn down(&mut self, peers: &[Id]) {
+        self.exclude(peers);
+        for p in peers {
+            if *p != self.me {
+                self.down.insert(p.clone());
+            }
+        }
+    }
+
+    /// Mark `peers` reachable again after a [`down`](Plumtree::down). They return as lazy peers
+    /// and are pulled back into the tree by the next message. Peers that were not down are
+    /// ignored.
+    pub fn up(&mut self, peers: &[Id]) {
+        for p in peers {
+            if self.down.remove(p) {
+                self.lazy.insert(p.clone());
+            }
         }
     }
 }
@@ -503,5 +556,43 @@ mod tests {
         let a = n.take_outbound();
         assert!(a.iter().all(|x| !matches!(x, Action::Send(3, _))));
         assert!(a.iter().any(|x| matches!(x, Action::Send(2, _))));
+    }
+
+    #[test]
+    fn a_down_peer_is_routed_around_then_restored_by_up() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [2, 3], [4], Config::default());
+        n.down(&[2]); // peer 2 unreachable
+        n.broadcast(0, b"x".to_vec());
+        let a = n.take_outbound();
+        // Nothing goes to the down peer 2; the other eager peer 3 still gets it.
+        assert!(a.iter().all(|x| !matches!(x, Action::Send(2, _))));
+        assert!(a.iter().any(|x| matches!(x, Action::Send(3, _))));
+        assert!(!n.eager().any(|&p| p == 2));
+
+        n.up(&[2]); // reachable again -> lazy
+        n.broadcast(0, b"y".to_vec());
+        n.tick(1);
+        let a = n.take_outbound();
+        // 2 hears about messages again, now as a lazy peer (via IHAVE).
+        assert!(a
+            .iter()
+            .any(|x| matches!(x, Action::Send(2, Message::Ihave(_)))));
+    }
+
+    #[test]
+    fn a_message_from_a_down_peer_restores_it() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [], [2], Config::default());
+        n.down(&[2]);
+        n.on_message(
+            0,
+            2,
+            Message::Gossip {
+                id: (2, 0),
+                payload: b"p".to_vec(),
+                round: 0,
+            },
+        );
+        let _ = n.take_outbound();
+        assert!(n.eager().any(|&p| p == 2)); // grafted back in, no longer down
     }
 }
