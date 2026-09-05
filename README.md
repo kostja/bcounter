@@ -1,7 +1,9 @@
 # bcounter
 
-A **bounded counter** ([BCounter][paper]) CRDT for distributed capacity quotas, plus a map of
-them for hierarchical (path) quotas. Pure, `#![forbid(unsafe_code)]`, no network, no clock.
+An **optimistic bounded-counter** CRDT for distributed capacity quotas, plus a map of them for
+hierarchical (path) quotas. Pure, `#![forbid(unsafe_code)]`, no network, no clock. A simpler
+relative of the escrow-based [bounded counter][paper] of Balegas et al.: it never falsely
+denies, and in exchange it can overshoot the limit (bounded — see below).
 
 Enforce *"no more than `limit` in total"* — bytes stored, objects held, connections open —
 across a cluster where every node accepts writes, **without a round trip on the write path**.
@@ -16,13 +18,25 @@ Grow-only-plus-max is the whole CRDT: **idempotent** (gossip redelivery is safe)
 **commutative** and **associative** (any delivery order converges). The laws are proven by
 `proptest` in the test suite.
 
-### Bounded overshoot, deliberately
+### Overshoot, and its cost
 
-A node admits a write when *its own* (possibly stale) view leaves room, so the true total can
-briefly exceed the limit — by **at most other nodes' un-gossiped consumption**, never
-unboundedly. The exact alternative (a strict per-node budget with transfers) never overshoots
-but *falsely denies* a write whose quota is stranded on another node — a worse answer for a
-capacity quota. This crate chooses the honest, bounded overshoot.
+A node admits a write when *its own* (possibly stale) view leaves room — it does not coordinate,
+so the true total can exceed the limit. Each node self-limits its own consumption to `limit`
+(its local check stops it once the usage it has *seen* reaches the limit), so with `N` nodes all
+spending against an empty view before any gossip, the total can reach `N · limit` — an overshoot
+of **`(N − 1) · limit`** in the worst case.
+
+In practice the overshoot is bounded by what other nodes consume *between gossip rounds*: small
+when gossip is frequent relative to how fast a node can burn the quota, and largest for **small
+quotas on large clusters** (the burst case above). This model therefore suits capacity limits
+that are large relative to the node count.
+
+If you need a hard bound, the paper's canonical bounded counter uses **escrow**: each node holds
+a share of the limit as local reservations that sum to the limit, so the invariant can never be
+violated — at the cost of *false denials* when a node's reservation is spent while quota sits
+unused on another node, plus rebalancing to move reservations around. This crate takes the
+optimistic branch deliberately (no false denials, no rebalancing, simpler). Escrow and quota
+transfer are future work.
 
 ## Usage
 
@@ -74,4 +88,4 @@ Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 contribution intentionally submitted for inclusion in this crate by you, as defined in the
 Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
-[paper]: https://arxiv.org/abs/1503.09052
+[paper]: https://arxiv.org/abs/1503.09052 "Valter Balegas et al., Extending Eventually Consistent Cloud Databases for Enforcing Numeric Invariants, 2015 (arXiv:1503.09052)"

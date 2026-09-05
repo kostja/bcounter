@@ -5,11 +5,13 @@
 //!
 //! The problem this solves: enforce "no more than `limit` in total" -- bytes stored, objects
 //! held, connections open -- across a cluster where every node accepts writes, **without a
-//! round trip on the write path**. The literature's answer is the bounded counter (Almeida &
-//! Baquero; Balegas et al.), a CRDT built for exactly numeric invariants. [`BCounter`] here is
-//! a capacity counter; a rate/bandwidth variant (a tick-refilled token bucket) is out of scope
-//! -- per-node lease refill (`rate / nodes`) rounds toward nothing for small quotas on large
-//! clusters and needs its own model.
+//! round trip on the write path**. The bounded counter of Balegas et al. ("Extending Eventually
+//! Consistent Cloud Databases for Enforcing Numeric Invariants", 2015, arXiv:1503.09052) is the
+//! CRDT built for exactly this. [`BCounter`] here is a simpler, *optimistic* relative of it: it
+//! never falsely denies, and in exchange it may overshoot the limit by a bounded amount (see
+//! below). A rate/bandwidth variant (a tick-refilled token bucket) is out of scope -- per-node
+//! lease refill (`rate / nodes`) rounds toward nothing for small quotas on large clusters and
+//! needs its own model.
 //!
 //! # The shape: a PN-counter over per-node slots, checked against a limit
 //!
@@ -25,15 +27,23 @@
 //! order converges). This is "merge by join, not arithmetic add", the property a counter
 //! reconstructed from re-delivered gossip must have.
 //!
-//! # Bounded overshoot, not exactness -- deliberately
+//! # Overshoot, and its cost -- the deliberate trade
 //!
-//! A node admits a write when **its own view** of the net usage leaves room. That view lags the
-//! true total by whatever other nodes have consumed and not yet gossiped, so the true total can
-//! briefly exceed `limit` -- by **at most the sum of other nodes' un-gossiped consumption**,
-//! never unboundedly. The alternative (a strict per-node budget with transfers, the classical
-//! exact BCounter) never overshoots but **falsely denies** a write whose quota is stranded on
-//! another node -- a worse answer for a capacity quota, where a user under their limit being
-//! refused reads as a bug. This crate chooses the honest, bounded overshoot.
+//! A node admits a write when **its own view** of the net usage leaves room; it does not
+//! coordinate, so the true total can exceed `limit`. Each node self-limits its own consumption
+//! to `limit` -- its check stops it once the usage it has *seen* reaches the limit -- so with
+//! `N` nodes all spending against an empty view before any gossip, the total can reach
+//! `N · limit`, an overshoot of **`(N − 1) · limit`** in the worst case. In practice it is
+//! bounded by what other nodes consume *between gossip rounds*: small when gossip is frequent
+//! relative to how fast a node burns the quota, and largest for small quotas on large clusters.
+//! This model therefore suits limits that are large relative to the node count.
+//!
+//! The paper's canonical bounded counter avoids overshoot entirely with **escrow** -- each node
+//! holds reservations summing to `limit`, so the invariant cannot be broken -- at the cost of
+//! **falsely denying** a write whose quota is stranded, unspent, on another node (a worse answer
+//! for a capacity quota, where a user under their limit being refused reads as a bug), plus the
+//! rebalancing to move reservations. This crate takes the optimistic branch deliberately. Escrow
+//! and quota transfer are future work.
 //!
 //! # Sans-network, sans-time
 //!
