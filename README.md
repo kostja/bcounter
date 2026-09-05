@@ -11,9 +11,7 @@ across a cluster where every node accepts writes, without a round trip on the wr
 > **What this crate is:** the data structures — [`BCounter`], [`BCounterMap`] — and the [`Quota`]
 > trait the server's quota must satisfy. That quota is not here. It needs durability, a
 > clock for lease expiry, and a rebalancing policy, so it belongs to the server that embeds this
-> crate. A minimal [`LocalQuota`] is included for tests and examples. The lease, Plumtree, and
-> adaptive-gossip parts of [The model](#the-model) marked *(planned)* are where that server is
-> headed.
+> crate. A minimal [`LocalQuota`] is included for tests and examples.
 
 ## Data structure
 
@@ -189,7 +187,7 @@ f  ≥  ─────  ·  ─────────           for ε = 0.1,
   `Λ`, or a fill horizon `T = Y/Λ`. An admin usually knows one of these ("about 1 TB per day").
   Make it an input.
 
-### Feasibility check and the smallest enforceable quota *(planned)*
+### Feasibility check and the smallest enforceable quota
 
 Topping up faster than some `f_max` is not practical (about 10 Hz per hot counter is a reasonable
 default). Solve the frequency law for `Y` at `f_max`:
@@ -204,7 +202,7 @@ reachable at `f_max`), or accept a soft, best-effort limit. `f_max` is per hot c
 is sparse, so only a few counters are near full and busy at once, and their deltas fit in one
 gossip message.
 
-### Enforcement architecture *(planned)*
+### Enforcement architecture
 
 `BCounter` and `Quota` are the mechanism. The server adds the policy:
 
@@ -231,13 +229,12 @@ coordinate per write on the counter that is near full. That is a separate case, 
 
 ## Scope
 
-Implemented: `BCounter`, `BCounterMap`, the `Quota` trait, and the reference `LocalQuota`.
-Planned (in the server): the durable, lease-based, expiring quota; the Plumtree broadcast tree;
-the feasibility check (`Y_min`) and adaptive gossip; a rate/bandwidth variant; and delta-encoded
-gossip. The `sim/` crate is a discrete-event simulator that drives the real `BCounter` and
-measures overshoot and false denial against the formulas above. It confirms overshoot is exactly
-zero at `Δ = 0` and at most `Δ` otherwise, and that false denials fall with a finer lease or a
-larger `Δ`.
+This crate is the data structures: `BCounter`, `BCounterMap`, the `Quota` trait, and the
+reference `LocalQuota`. The durable, lease-based quota with its Raft-backed ledger, the failure
+detector, and the transport belong to the server that embeds it. The `sim/` crate is a
+discrete-event simulator that drives the real `BCounter` and measures overshoot and false
+denial against the formulas above. It confirms overshoot is exactly zero at `Δ = 0` and at most
+`Δ` otherwise, and that false denials fall with a finer lease or a larger `Δ`.
 
 ## References
 
