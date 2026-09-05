@@ -88,6 +88,27 @@ assert_eq!(m.acquire(&["bucket", "tenant", "root"], 40), Ok(()));
 assert_eq!(m.global_used(&"tenant"), 40);
 ```
 
+### Gossiping with plumtree
+
+`bcounter` holds the state; it does not move it between nodes. To gossip, export a counter's
+slots with `delta()` and merge a peer's with `apply()`:
+
+- `delta() -> Vec<(node, acquired, released)>` — the slots to send, as plain tuples (you encode
+  them in your own wire format)
+- `apply(&[(node, acquired, released)])` — merge a peer's slots, per-slot max, idempotent
+
+Pair it with [`plumtree`](https://crates.io/crates/plumtree) (an epidemic-broadcast layer) and a
+worker fiber:
+
+1. `counter.delta()` → encode → `plumtree.broadcast(now, bytes)`
+2. run plumtree's `Send` actions over your connection pool
+3. on receipt, hand the message to `plumtree.on_message`; for a `Deliver`, decode and
+   `counter.apply(...)`
+
+Neither library knows about the other. The `gossip-sim` crate in this repository runs the two
+over a lossy surrogate network: it shows a quota staying enforced and every node's view of the
+usage converging through 30% message loss, a governor change, and nodes joining and leaving.
+
 ---
 
 ## The model

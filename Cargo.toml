@@ -1,5 +1,5 @@
 [workspace]
-members = ["sim"]
+members = ["plumtree", "sim", "gossip-sim"]
 
 [package]
 name = "bcounter"
@@ -15,7 +15,7 @@ readme = "README.md"
 keywords = ["crdt", "counter", "quota", "distributed", "bounded"]
 categories = ["data-structures", "concurrency"]
 authors = ["Konstantin Osipov <kostja.osipov@gmail.com>"]
-exclude = ["sim"]
+exclude = ["sim", "plumtree", "gossip-sim"]
 
 [dependencies]
 

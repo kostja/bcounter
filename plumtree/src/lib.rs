@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Konstantin Osipov.
+
+//! A pure Plumtree state machine for epidemic broadcast.
+//!
+//! Plumtree (Leitão, Pereira, Rodrigues, "Epidemic Broadcast Trees", SRDS 2007) spreads a
+//! message to every node over a spanning tree, and repairs the tree with lazy gossip when a
+//! message is lost. It gives tree-cost delivery (one full message per edge) with gossip-level
+//! resilience.
+//!
+//! This crate is the algorithm only. It reads no clock and no socket. It is a state machine:
+//! you feed it events and it returns [`Action`]s. A caller -- a fiber with a connection pool --
+//! runs the actions and supplies the clock. That is the same split [`bcounter`] uses, and the
+//! two work together: `bcounter` produces a delta, this picks the peers, the caller sends the
+//! bytes, the peer feeds them back to `bcounter`. Neither library knows about the other.
+//!
+//! # How it works
+//!
+//! Each node keeps two peer sets. **Eager** peers get the full message (a push down the tree).
+//! **Lazy** peers get only its id (an `IHAVE`). A node that hears an id it does not have asks
+//! for the message with a `GRAFT`, which also pulls that peer into its eager set. A node that
+//! gets the same message twice prunes the duplicate link into the lazy set with a `PRUNE`.
+//! Over one or two rounds the eager links settle into a tree, and the lazy links stand by to
+//! repair it.
+//!
+//! # Loss, and why the caller should re-broadcast state
+//!
+//! `GRAFT` recovers a message that the eager tree dropped, as long as one lazy peer announced
+//! it. If every announcer is unreachable, that one message is lost. So do not rely on any
+//! single broadcast arriving. Carry CRDT state, not events: re-broadcast the current state on a
+//! timer, and merge on receipt. A lost message is then covered by the next state broadcast, and
+//! a duplicate is harmless. With that, delivery need not be perfect for the result to converge.
+//!
+//! # Example
+//!
+//! ```
+//! use plumtree::{Plumtree, Message, Action, Config};
+//!
+//! // Node 1, with two eager peers and one lazy peer.
+//! let mut n1: Plumtree<u32> = Plumtree::new(1, [2, 3], [4], Config::default());
+//! let actions = n1.broadcast(0, b"hello".to_vec());
+//! // It pushes the full message to its eager peers.
+//! assert!(actions.iter().any(|a| matches!(a, Action::Send(2, Message::Gossip { .. }))));
+//! assert!(actions.iter().any(|a| matches!(a, Action::Send(3, Message::Gossip { .. }))));
+//! ```
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// A message id: the node that first broadcast it, and that node's sequence number. Unique
+/// across the cluster without coordination, because a node never reuses its own sequence.
+pub type MsgId<Id> = (Id, u64);
+
+/// A message between nodes. The caller serializes and sends it; on receipt it feeds it back in
+/// through [`Plumtree::on_message`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Message<Id> {
+    /// A full message on an eager link.
+    Gossip {
+        /// Its id.
+        id: MsgId<Id>,
+        /// The payload -- opaque to this crate.
+        payload: Vec<u8>,
+        /// How many hops from the origin. Carried for tree tuning; not required for correctness.
+        round: u16,
+    },
+    /// Ids a lazy peer has, announced so a node missing one can ask for it.
+    Ihave(Vec<MsgId<Id>>),
+    /// A request for a message a node heard of via `Ihave` but does not have.
+    Graft(MsgId<Id>),
+    /// A request to stop sending full messages on this link -- move it to lazy.
+    Prune,
+}
+
+/// Something the caller must do: send a message, or deliver a received payload to the
+/// application.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action<Id> {
+    /// Send `Message` to this peer.
+    Send(Id, Message<Id>),
+    /// Hand this payload to the application (for `bcounter`, decode it and `apply`).
+    Deliver(Vec<u8>),
+}
+
+/// Tuning. Times are in whatever unit the caller's clock uses (milliseconds, say).
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// How long to wait after hearing an `Ihave` before sending a `Graft` for it.
+    pub graft_timeout: u64,
+    /// The largest number of payloads to keep for serving `Graft`s. Oldest are dropped.
+    pub cache_cap: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            graft_timeout: 500,
+            cache_cap: 512,
+        }
+    }
+}
+
+/// A message a node has heard of (via `Ihave`) but does not yet have.
+struct Missing<Id> {
+    /// Peers that announced it, tried in turn.
+    announcers: VecDeque<Id>,
+    /// When to send the next `Graft`.
+    deadline: u64,
+}
+
+/// One node's Plumtree state.
+///
+/// Generic over the node id `Id`. Feed it events; run the [`Action`]s it returns. See the crate
+/// docs.
+pub struct Plumtree<Id: Ord + Clone> {
+    me: Id,
+    eager: BTreeSet<Id>,
+    lazy: BTreeSet<Id>,
+    seq: u64,
+    cache: BTreeMap<MsgId<Id>, Vec<u8>>,
+    cache_order: VecDeque<MsgId<Id>>,
+    missing: BTreeMap<MsgId<Id>, Missing<Id>>,
+    /// Ids to announce to lazy peers, collected until the next [`tick`](Plumtree::tick).
+    lazy_announce: BTreeSet<MsgId<Id>>,
+    cfg: Config,
+}
+
+impl<Id: Ord + Clone> Plumtree<Id> {
+    /// A new node with an initial split of peers into eager and lazy. The caller chooses the
+    /// split from membership -- a common choice is `ceil(log2 N) + 1` random eager peers, the
+    /// rest lazy.
+    pub fn new<E, L>(me: Id, eager: E, lazy: L, cfg: Config) -> Self
+    where
+        E: IntoIterator<Item = Id>,
+        L: IntoIterator<Item = Id>,
+    {
+        Self {
+            me,
+            eager: eager.into_iter().collect(),
+            lazy: lazy.into_iter().collect(),
+            seq: 0,
+            cache: BTreeMap::new(),
+            cache_order: VecDeque::new(),
+            missing: BTreeMap::new(),
+            lazy_announce: BTreeSet::new(),
+            cfg,
+        }
+    }
+
+    /// This node's current eager peers (its tree links). For tests and inspection.
+    pub fn eager(&self) -> impl Iterator<Item = &Id> {
+        self.eager.iter()
+    }
+
+    fn remember(&mut self, id: MsgId<Id>, payload: Vec<u8>) {
+        if self.cache.insert(id.clone(), payload).is_none() {
+            self.cache_order.push_back(id);
+            while self.cache_order.len() > self.cfg.cache_cap {
+                if let Some(old) = self.cache_order.pop_front() {
+                    self.cache.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Start spreading `payload`. Returns the pushes to eager peers; lazy peers are told at the
+    /// next [`tick`](Plumtree::tick). `now` seeds nothing here but keeps the event API uniform.
+    pub fn broadcast(&mut self, _now: u64, payload: Vec<u8>) -> Vec<Action<Id>> {
+        let id = (self.me.clone(), self.seq);
+        self.seq += 1;
+        self.remember(id.clone(), payload.clone());
+        self.spread(&id, &payload, 0, None)
+    }
+
+    /// Push `id`/`payload` to every eager peer except `except`, and queue an `Ihave` for every
+    /// lazy peer.
+    fn spread(
+        &mut self,
+        id: &MsgId<Id>,
+        payload: &[u8],
+        round: u16,
+        except: Option<&Id>,
+    ) -> Vec<Action<Id>> {
+        let mut actions = Vec::new();
+        for p in &self.eager {
+            if Some(p) != except {
+                actions.push(Action::Send(
+                    p.clone(),
+                    Message::Gossip {
+                        id: id.clone(),
+                        payload: payload.to_vec(),
+                        round,
+                    },
+                ));
+            }
+        }
+        if !self.lazy.is_empty() {
+            self.lazy_announce.insert(id.clone());
+        }
+        actions
+    }
+
+    /// Handle a message from `from`.
+    pub fn on_message(&mut self, now: u64, from: Id, msg: Message<Id>) -> Vec<Action<Id>> {
+        match msg {
+            Message::Gossip { id, payload, round } => self.on_gossip(from, id, payload, round),
+            Message::Ihave(ids) => {
+                self.on_ihave(now, from, ids);
+                Vec::new()
+            }
+            Message::Graft(id) => self.on_graft(from, id),
+            Message::Prune => {
+                self.move_to_lazy(&from);
+                Vec::new()
+            }
+        }
+    }
+
+    fn on_gossip(
+        &mut self,
+        from: Id,
+        id: MsgId<Id>,
+        payload: Vec<u8>,
+        round: u16,
+    ) -> Vec<Action<Id>> {
+        if self.cache.contains_key(&id) {
+            // A duplicate: this eager link is redundant. Prune it.
+            self.move_to_lazy(&from);
+            return vec![Action::Send(from, Message::Prune)];
+        }
+        // New. Cache it, stop waiting for it, deliver it, and pass it on.
+        self.remember(id.clone(), payload.clone());
+        self.missing.remove(&id);
+        self.graft_in(&from);
+        let mut actions = vec![Action::Deliver(payload.clone())];
+        actions.extend(self.spread(&id, &payload, round.saturating_add(1), Some(&from)));
+        actions
+    }
+
+    fn on_ihave(&mut self, now: u64, from: Id, ids: Vec<MsgId<Id>>) {
+        for id in ids {
+            if self.cache.contains_key(&id) {
+                continue;
+            }
+            let entry = self.missing.entry(id).or_insert_with(|| Missing {
+                announcers: VecDeque::new(),
+                deadline: now + self.cfg.graft_timeout,
+            });
+            entry.announcers.push_back(from.clone());
+        }
+    }
+
+    fn on_graft(&mut self, from: Id, id: MsgId<Id>) -> Vec<Action<Id>> {
+        self.graft_in(&from);
+        if let Some(payload) = self.cache.get(&id) {
+            vec![Action::Send(
+                from,
+                Message::Gossip {
+                    id,
+                    payload: payload.clone(),
+                    round: 0,
+                },
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn graft_in(&mut self, peer: &Id) {
+        if *peer != self.me {
+            self.lazy.remove(peer);
+            self.eager.insert(peer.clone());
+        }
+    }
+
+    fn move_to_lazy(&mut self, peer: &Id) {
+        if self.eager.remove(peer) {
+            self.lazy.insert(peer.clone());
+        }
+    }
+
+    /// Advance the clock to `now`. Flushes queued `Ihave` announcements to lazy peers, and sends
+    /// a `Graft` for any message still missing past its deadline (trying the next announcer, and
+    /// re-arming). Call it on a timer.
+    pub fn tick(&mut self, now: u64) -> Vec<Action<Id>> {
+        let mut actions = Vec::new();
+
+        // Announce everything heard since the last tick to every lazy peer.
+        if !self.lazy_announce.is_empty() && !self.lazy.is_empty() {
+            let ids: Vec<MsgId<Id>> = self.lazy_announce.iter().cloned().collect();
+            for p in &self.lazy {
+                actions.push(Action::Send(p.clone(), Message::Ihave(ids.clone())));
+            }
+        }
+        self.lazy_announce.clear();
+
+        // Graft anything still missing.
+        let due: Vec<MsgId<Id>> = self
+            .missing
+            .iter()
+            .filter(|(_, m)| m.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            let give_up = {
+                let m = self.missing.get_mut(&id).expect("id came from missing");
+                if let Some(next) = m.announcers.pop_front() {
+                    actions.push(Action::Send(next, Message::Graft(id.clone())));
+                    m.deadline = now + self.cfg.graft_timeout;
+                    false
+                } else {
+                    // No one left to ask. Give up; a later state broadcast will heal it.
+                    true
+                }
+            };
+            if give_up {
+                self.missing.remove(&id);
+            }
+        }
+        actions
+    }
+
+    /// Update membership. New peers start lazy and are grafted into the tree by the next
+    /// message. Departed peers are dropped from both sets and from any pending recovery.
+    pub fn membership(&mut self, added: &[Id], removed: &[Id]) {
+        for p in added {
+            if *p != self.me && !self.eager.contains(p) {
+                self.lazy.insert(p.clone());
+            }
+        }
+        for p in removed {
+            self.eager.remove(p);
+            self.lazy.remove(p);
+            for m in self.missing.values_mut() {
+                m.announcers.retain(|a| a != p);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_pushes_to_eager_and_queues_lazy() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [2, 3], [4], Config::default());
+        let a = n.broadcast(0, b"x".to_vec());
+        // Full push to both eager peers, nothing to the lazy peer yet.
+        assert_eq!(a.len(), 2);
+        assert!(a.contains(&Action::Send(
+            2,
+            Message::Gossip {
+                id: (1, 0),
+                payload: b"x".to_vec(),
+                round: 0
+            }
+        )));
+        // The lazy peer is told on the next tick.
+        let t = n.tick(1);
+        assert_eq!(t, vec![Action::Send(4, Message::Ihave(vec![(1, 0)]))]);
+    }
+
+    #[test]
+    fn a_new_gossip_is_delivered_and_forwarded() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [2], [], Config::default());
+        let a = n.on_message(
+            0,
+            5,
+            Message::Gossip {
+                id: (9, 0),
+                payload: b"p".to_vec(),
+                round: 0,
+            },
+        );
+        // Delivered to the app, and forwarded to eager peer 2, not back to 5.
+        assert!(a.contains(&Action::Deliver(b"p".to_vec())));
+        assert!(a.contains(&Action::Send(
+            2,
+            Message::Gossip {
+                id: (9, 0),
+                payload: b"p".to_vec(),
+                round: 1
+            }
+        )));
+        // Sender 5 was grafted into the eager set.
+        assert!(n.eager().any(|&p| p == 5));
+    }
+
+    #[test]
+    fn a_duplicate_gossip_prunes_the_link() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [2, 3], [], Config::default());
+        let m = Message::Gossip {
+            id: (9, 0),
+            payload: b"p".to_vec(),
+            round: 0,
+        };
+        n.on_message(0, 2, m.clone());
+        let a = n.on_message(0, 3, m); // same message again, from 3
+        assert_eq!(a, vec![Action::Send(3, Message::Prune)]);
+        assert!(!n.eager().any(|&p| p == 3)); // 3 moved to lazy
+    }
+
+    #[test]
+    fn a_missing_message_is_grafted_after_the_timeout() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [], [2], Config::default());
+        // Peer 2 announces an id we do not have.
+        n.on_message(0, 2, Message::Ihave(vec![(7, 0)]));
+        // Before the timeout, nothing.
+        assert!(n.tick(100).is_empty());
+        // After it, a GRAFT to the announcer.
+        let a = n.tick(600);
+        assert_eq!(a, vec![Action::Send(2, Message::Graft((7, 0)))]);
+    }
+
+    #[test]
+    fn a_graft_is_answered_with_the_cached_payload() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [2], [], Config::default());
+        n.broadcast(0, b"p".to_vec()); // id (1,0) is now cached
+        let a = n.on_message(0, 8, Message::Graft((1, 0)));
+        assert_eq!(
+            a,
+            vec![Action::Send(
+                8,
+                Message::Gossip {
+                    id: (1, 0),
+                    payload: b"p".to_vec(),
+                    round: 0
+                }
+            )]
+        );
+        assert!(n.eager().any(|&p| p == 8)); // grafted
+    }
+
+    #[test]
+    fn departed_peers_are_dropped() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [2, 3], [4], Config::default());
+        n.membership(&[], &[3, 4]);
+        assert!(!n.eager().any(|&p| p == 3));
+    }
+}
