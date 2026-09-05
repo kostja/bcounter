@@ -10,10 +10,10 @@
 //!
 //! Spending here is purely local: it checks the rights already granted to each scope, no pool
 //! and no view of other nodes. When a scope is short, [`spend`](EscrowMap::spend) names it and
-//! charges nothing; the shell then tops that scope up from its pool (via
+//! charges nothing; the server then tops that scope up from its pool (via
 //! [`grant`](EscrowMap::grant)) and retries. Keeping the pool out of the fan-out is what lets
 //! the map stay pure -- each scope has its own limit and therefore its own pool, and that
-//! bookkeeping belongs to the shell.
+//! bookkeeping belongs to the server.
 //!
 //! Sparse: a scope appears only once it is granted rights or spends; an untouched scope reads
 //! zero and costs nothing.
@@ -63,7 +63,7 @@ impl<K: Ord + Clone, Id: Ord + Clone> EscrowMap<K, Id> {
         self.escrows.get(scope).map_or(0, Escrow::global_used)
     }
 
-    /// Grant `amount` rights to one `scope`, creating its escrow if new. This is how the shell
+    /// Grant `amount` rights to one `scope`, creating its escrow if new. This is how the server
     /// tops a scope up after draining its pool.
     pub fn grant(&mut self, scope: &K, amount: u64) {
         let me = self.me.clone();
@@ -195,7 +195,7 @@ mod tests {
     fn a_top_up_reopens_a_short_scope() {
         let mut m = granted(100, 30, 9999);
         assert!(m.spend(&["bucket", "tenant", "root"], 40).is_err());
-        m.grant(&"tenant", 20); // shell tops the tenant up from its pool
+        m.grant(&"tenant", 20); // server tops the tenant up from its pool
         assert_eq!(m.spend(&["bucket", "tenant", "root"], 40), Ok(()));
     }
 

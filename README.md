@@ -11,10 +11,10 @@ across a cluster where every node accepts writes, **without a round trip on the 
 
 > **What this crate is:** the pure data structures — [`Escrow`], [`EscrowMap`] — and the
 > [`Pool`] **trait** the allocator must satisfy. The allocator/pool *implementation* lives in
-> the shell embedding this (it needs durability, a clock for lease TTLs, and a rebalancing
+> the server embedding this (it needs durability, a clock for lease TTLs, and a rebalancing
 > policy); a minimal in-process [`LocalPool`] is provided for tests and examples. The lease,
 > Plumtree, and adaptive-gossip machinery in [The model](#the-model) marked *(planned)* describe
-> where that shell is headed.
+> where that server is headed.
 
 ## Data structure
 
@@ -68,7 +68,7 @@ pub trait Pool<Id> {
 Honor `Σ outstanding grants ≤ limit + Δ` and the escrow counters it feeds can never exceed
 `limit + Δ` (`Δ = 0` for strict, overshoot-free enforcement; `Δ > 0` trades a bounded overshoot
 for fewer false denials). Durability across leader changes, lease TTLs, and rebalancing policy
-are the implementor's — expected to be the shell.
+are the implementor's — expected to be the server.
 
 ### Hierarchical quotas
 
@@ -81,7 +81,7 @@ short scope is named back to the caller, which tops it up from that scope's pool
 use bcounter::EscrowMap;
 
 let mut m: EscrowMap<&str> = EscrowMap::new(1);
-m.grant(&"bucket", 100);            // rights the shell drew from each scope's pool
+m.grant(&"bucket", 100);            // rights the server drew from each scope's pool
 m.grant(&"tenant", 500);
 m.grant(&"root", 9999);
 assert_eq!(m.spend(&["bucket", "tenant", "root"], 40), Ok(()));
@@ -168,7 +168,7 @@ keeps only a handful near-full-and-active, and their deltas batch into one gossi
 
 ### Enforcement architecture *(planned)*
 
-`Escrow` + `Pool` are the mechanism; the shell adds the policy:
+`Escrow` + `Pool` are the mechanism; the server adds the policy:
 
 - **Hierarchical leases over a broadcast tree.** A [Plumtree][plumtree] tree, seeded from Raft
   membership and repaired by lazy-push, carries grants: the root owns the pool, each parent
@@ -192,7 +192,7 @@ coordination on the near-full counter) — a separate class, named explicitly.
 ## Scope
 
 **Implemented:** the escrow `Escrow` and `EscrowMap`, the `Pool` trait, and a reference
-`LocalPool`. **Planned (in the shell):** the durable, lease-based, TTL-fenced pool; the Plumtree
+`LocalPool`. **Planned (in the server):** the durable, lease-based, TTL-fenced pool; the Plumtree
 broadcast tree; the adaptive-gossip / feasibility (`Y_min`) layer; a rate/bandwidth variant; and
 delta-encoded gossip. The `sim/` crate is a discrete-event simulator that drives the real
 `Escrow` and measures overshoot and false-denial against the formulas above — so the constants

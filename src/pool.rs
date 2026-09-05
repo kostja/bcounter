@@ -3,7 +3,7 @@
 
 //! The allocator contract, and a reference in-process implementation.
 //!
-//! The real allocator lives in the shell embedding this crate: it needs durability across
+//! The real allocator lives in the server embedding this crate: it needs durability across
 //! leader changes (an outstanding-grant ledger that survives failover, or a new leader
 //! re-hands-out budget already lent → overshoot), a clock for lease expiry and fencing, and a
 //! rebalancing policy that decides when to move grants between nodes. None of that belongs in a
@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// Honor that and the escrow counters it feeds can never let the cluster exceed `limit + Δ`
 /// (`Δ = 0` for strict, overshoot-free enforcement; `Δ > 0` trades a bounded overshoot for fewer
 /// false denials). Everything else -- persistence, lease TTLs, when and how to rebalance -- is
-/// the implementor's, and the implementor is expected to be the shell, not this crate.
+/// the implementor's, and the implementor is expected to be the server, not this crate.
 pub trait Pool<Id> {
     /// Lend up to `want` additional rights to `who`. Returns the amount actually granted
     /// (`≤ want`), which is `0` when the pool is exhausted. **Must not** let total outstanding
@@ -42,7 +42,7 @@ pub trait Pool<Id> {
 /// A minimal in-process [`Pool`] for tests and examples. **Not for production**: it is neither
 /// durable across restarts nor safe across a leader change, and it has no lease expiry -- a
 /// crashed node's grant is stranded until something calls [`release`](Pool::release). The real
-/// pool is the shell's.
+/// pool is the server's.
 #[derive(Clone, Debug, Default)]
 pub struct LocalPool<Id: Ord + Clone> {
     ceiling: u64,

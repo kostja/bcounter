@@ -40,7 +40,7 @@
 //!
 //! The **pool / allocator is deliberately out of this crate** -- it needs durability across
 //! leader changes, a clock for lease expiry, and a rebalancing policy, all of which belong to
-//! the shell embedding this. What the crate defines is the [`Pool`] **trait**: the contract that
+//! the server embedding this. What the crate defines is the [`Pool`] **trait**: the contract that
 //! allocator must satisfy for the escrow counters it feeds to stay safe. A minimal in-process
 //! [`LocalPool`] is provided for tests and examples, not for production.
 //!
