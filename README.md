@@ -88,30 +88,25 @@ assert_eq!(m.acquire(&["bucket", "tenant", "root"], 40), Ok(()));
 assert_eq!(m.global_used(&"tenant"), 40);
 ```
 
-### Gossiping with plumtree
+### Reporting usage
 
-`bcounter` holds the state; it does not move it between nodes. To gossip, export a counter's
-slots with `delta()` and merge a peer's with `apply()`:
+`bcounter` holds the state; it does not move it. A node reports its slot to the governor, which
+uses the reports to decide when to move unused rights from an idle node to a busy one. The
+cluster-wide total is a metrics concern (Grafana), not something any node needs: enforcement is
+local against the lease. Two plain methods carry a report, with no wire format of their own:
 
-- `delta() -> Vec<(node, acquired, released)>` — the slots to send, as plain tuples (you encode
-  them in your own wire format)
-- `apply(&[(node, acquired, released)])` — merge a peer's slots, per-slot max, idempotent
+- `delta() -> Vec<(node, acquired, released)>` — this node's slots, as plain tuples (encode them
+  however you like)
+- `apply(&[(node, acquired, released)])` — merge a report: per-slot max, idempotent
 
-Pair it with [`plumtree-fsm`](https://github.com/kostja/plumtree) (an epidemic-broadcast layer) and a
-worker fiber:
-
-1. `counter.delta()` → encode → `plumtree.broadcast(bytes)`
-2. run plumtree's `Send` actions over your connection pool
-3. on receipt, hand the message to `plumtree.on_message`; for a `Deliver`, decode and
-   `counter.apply(...)`
-
-Neither library knows about the other. The `gossip-sim` crate in this repository runs the two
-over a lossy surrogate network: it shows a quota staying enforced and every node's view of the
-usage converging through 30% message loss, a governor change, and nodes joining and leaving.
+Usage is not gossiped node-to-node. The `gossip-sim` crate in this repository does flood
+`delta`/`apply` state over [`plumtree-fsm`](https://github.com/kostja/plumtree), but as a
+transport test of that library -- convergence under message loss and churn -- not as the quota
+design.
 
 ## In numbers: when is it accurate enough?
 
-Three different questions hide behind "accuracy". They have different answers.
+Two different questions hide behind "accuracy". They have different answers.
 
 ### The limit itself: exact, always
 
@@ -119,50 +114,6 @@ A node never spends past its lease, and the governor never lends past the limit.
 never exceeds the limit -- at any cluster size, gossip rate, or load. Overshoot is zero by
 construction, and the simulator measures 0.00 at every setting. This part needs no gossip: a
 node admits a write against its local lease, and refills from the governor when short.
-
-### The global view: one gossip period behind
-
-Gossip serves only the *view* -- what `global_used` reports, which drives metrics and
-rebalancing. A node's view trails the truth by about one gossip period of cluster consumption:
-
-```
-lag  ≈  Λ / r        (events)
-```
-
-Here Λ is how fast the quota is consumed, cluster-wide, in events per second, and r is how often
-each node broadcasts. Network propagation adds log₂N hops of latency -- ten hops for a thousand
-nodes, a few milliseconds -- far under one period, so cluster size does not change this.
-
-| consumption Λ | r = 1 broadcast/s | r = 10 broadcasts/s |
-|---|---|---|
-| 10 events/s | 10 events behind | 1 |
-| 100 events/s | 100 | 10 |
-| 1,000 events/s | 1,000 | 100 |
-
-Whether that is accurate enough depends on the quota size Y: the view is good when the lag is
-small against it, `Λ / (r · Y) ≪ 1`. For example:
-
-- Y = 1,000,000 objects, Λ = 1,000/s, r = 1/s: 1,000 behind, 0.1% -- fine.
-- Y = 1,000 objects, Λ = 100/s, r = 1/s: 100 behind, 10% -- marginal; use r = 10.
-- Y = 100 objects, Λ = 100/s, r = 1/s: 100 behind, 100% -- the view is useless. The limit still
-  holds; only the reported usage is a period late.
-
-### The cost: gossip messages, and the cluster-size limit
-
-If every node broadcasts its full state r times a second and each broadcast floods the tree, the
-cluster sends about `2 · r · N²` messages a second (N tree edges plus N `IHAVE`s per broadcast,
-N broadcasts per period):
-
-| N nodes | r = 1/s | r = 10/s |
-|---|---|---|
-| 10 | 200 msg/s | 2,000 |
-| 100 | 20,000 | 200,000 |
-| 1,000 | 2,000,000 | 20,000,000 |
-
-So all-to-all full-state gossip is fine to about a hundred nodes and does not scale to a
-thousand. Past that, aggregate through the governor: each node reports its slot to it and it
-broadcasts the sum, `2 · r · N` messages a second -- 2,000/s at a thousand nodes. And if all you
-need is the hard limit, skip the view gossip entirely; enforcement runs on lease refills alone.
 
 ### False denials: the price of no overshoot
 
@@ -190,7 +141,7 @@ The question is what, and how much. This section is the analysis behind the desi
 
 You cannot make both zero without coordinating on every write, which is the round trip we avoid.
 Escrow makes overshoot zero and pays in false denials. Two things reduce the false denials: a
-larger `Δ` (overshoot allowance) and more frequent gossip.
+larger `Δ` (overshoot allowance) and more frequent lease top-ups.
 
 ### Escrow as an inventory problem
 
