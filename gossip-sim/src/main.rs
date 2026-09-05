@@ -7,13 +7,13 @@
 //! Every node runs a `plumtree::Plumtree` and a `bcounter::BCounter`. A node acquires quota
 //! locally against a lease it drew from the governor (a `bcounter::LocalQuota`). It gossips its
 //! usage as a `bcounter` delta over `plumtree`; peers `apply` it. The network drops a
-//! configurable fraction of messages, and the run can change the governor and add or remove a
-//! node partway through.
+//! configurable fraction of messages, and a timeline of events -- governor changes, nodes
+//! joining and leaving, nodes going down and coming back up -- plays out during the run.
 //!
 //! It checks two things:
 //!   * **enforcement** — the true total usage never exceeds the quota's ceiling, and
-//!   * **convergence** — after the load stops, every live node's view of the global usage agrees
-//!     with the truth, even under message loss, a governor change, and membership churn.
+//!   * **convergence** — after the load stops, every reachable member's view of the global usage
+//!     agrees with the truth, through message loss and the whole event timeline.
 //!
 //! Deterministic (seeded), no external dependencies. Run: `cargo run -p gossip-sim`.
 
@@ -47,9 +47,8 @@ impl Rng {
 
 // ---------------------------------------------------------------- wire format
 
-/// Encode a `BCounter<u32>` delta as bytes: 20 per slot (u32 node + u64 acquired + u64 released),
-/// big-endian. This is the sim's stand-in for Picodata's msgpack; the point is that the bytes
-/// are opaque to `plumtree`.
+/// Encode a `BCounter<u32>` delta as bytes: 20 per slot, big-endian. The sim's stand-in for
+/// Picodata's msgpack; the point is the bytes are opaque to `plumtree`.
 fn encode(delta: &[(u32, u64, u64)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(delta.len() * 20);
     for (id, a, r) in delta {
@@ -73,11 +72,36 @@ fn decode(bytes: &[u8]) -> Vec<(u32, u64, u64)> {
 
 // ---------------------------------------------------------------- world
 
+/// A scheduled change to the cluster.
+#[derive(Clone, Copy, Debug)]
+enum Event {
+    /// The governor (lease root) moves to another member -- a Raft leader change.
+    Governor,
+    /// A brand-new node joins the cluster.
+    Join,
+    /// A node leaves for good (membership shrinks).
+    Leave(u32),
+    /// A node becomes unreachable but stays a member (a transient failure).
+    Down(u32),
+    /// A downed node becomes reachable again and catches up.
+    Up(u32),
+}
+
 struct Node {
     id: u32,
     tree: Plumtree<u32>,
     usage: BCounter<u32>,
-    alive: bool,
+    /// Still part of the cluster (a `Leave` clears this).
+    member: bool,
+    /// Reachable and processing (a `Down` clears it, an `Up` restores it).
+    up: bool,
+}
+
+impl Node {
+    /// Live for the run's purposes: a member that is reachable.
+    fn active(&self) -> bool {
+        self.member && self.up
+    }
 }
 
 struct Pending {
@@ -99,14 +123,7 @@ struct Params {
     load_amount: u64,
     load_until: u64,
     rounds: u64,
-    /// Move the governor to a new node at this round (`None` to leave it).
-    change_governor_at: Option<u64>,
-    /// Kill a node at this round (in these runs, during the quiet phase, after its usage has
-    /// spread -- a node dying mid-load would leave its un-gossiped tail unaccounted, which real
-    /// durable per-node usage would recover but this sim does not model).
-    kill_at: Option<(u64, u32)>,
-    /// Add a fresh node at this round.
-    join_at: Option<u64>,
+    events: Vec<(u64, Event)>,
     seed: u64,
 }
 
@@ -131,7 +148,8 @@ impl World {
                 id,
                 tree: fresh_tree(id, &ids, p.fanout, &mut rng),
                 usage: BCounter::new(id, 0),
-                alive: true,
+                member: true,
+                up: true,
             })
             .collect();
         World {
@@ -172,6 +190,13 @@ impl World {
         }
     }
 
+    /// Drain a node's plumtree outbound queue and run it.
+    fn pump(&mut self, i: usize) {
+        let id = self.nodes[i].id;
+        let actions = self.nodes[i].tree.take_outbound();
+        self.run(id, actions);
+    }
+
     /// A node draws a lease chunk from the governor if it is short, then acquires `amount`.
     fn offer_load(&mut self, i: usize) {
         let amount = self.p.load_amount;
@@ -187,9 +212,9 @@ impl World {
 
     fn step(&mut self) {
         self.now += 1;
-        self.apply_scenario_events();
+        self.apply_events();
 
-        // Deliver due messages.
+        // Deliver due messages to reachable members.
         let mut due = Vec::new();
         let mut keep = Vec::new();
         for m in self.net.drain(..) {
@@ -202,16 +227,16 @@ impl World {
         self.net = keep;
         for m in due {
             if let Some(i) = self.idx(m.dst) {
-                if self.nodes[i].alive {
-                    let actions = self.nodes[i].tree.on_message(self.now, m.from, m.msg);
-                    self.run(m.dst, actions);
+                if self.nodes[i].active() {
+                    self.nodes[i].tree.on_message(self.now, m.from, m.msg);
+                    self.pump(i);
                 }
             }
         }
 
-        // Load and gossip.
+        // Load and gossip on every active node.
         for i in 0..self.nodes.len() {
-            if !self.nodes[i].alive {
+            if !self.nodes[i].active() {
                 continue;
             }
             if self.now <= self.p.load_until {
@@ -219,70 +244,87 @@ impl World {
             }
             if self.now.is_multiple_of(self.p.gossip_every) {
                 let bytes = encode(&self.nodes[i].usage.delta());
-                let actions = self.nodes[i].tree.broadcast(self.now, bytes);
-                let id = self.nodes[i].id;
-                self.run(id, actions);
+                self.nodes[i].tree.broadcast(self.now, bytes);
+                self.pump(i);
             }
         }
 
-        // Tick every live node's tree.
+        // Tick every active node's tree.
         for i in 0..self.nodes.len() {
-            if self.nodes[i].alive {
-                let actions = self.nodes[i].tree.tick(self.now);
-                let id = self.nodes[i].id;
-                self.run(id, actions);
+            if self.nodes[i].active() {
+                self.nodes[i].tree.tick(self.now);
+                self.pump(i);
             }
         }
     }
 
-    fn apply_scenario_events(&mut self) {
-        if self.p.change_governor_at == Some(self.now) {
-            // The ledger moves with the governor -- modelling raft inheritance. `LocalQuota`
-            // already holds the outstanding grants, so nothing is re-issued.
-            self.governor = self.next_live_after(self.governor);
-        }
-        if let Some((at, victim)) = self.p.kill_at {
-            if at == self.now {
-                if let Some(i) = self.idx(victim) {
-                    self.nodes[i].alive = false;
-                }
-                for n in &mut self.nodes {
-                    if n.alive {
-                        n.tree.membership(&[], &[victim]);
+    fn apply_events(&mut self) {
+        let due: Vec<Event> = self
+            .p
+            .events
+            .iter()
+            .filter(|(at, _)| *at == self.now)
+            .map(|(_, e)| *e)
+            .collect();
+        for e in due {
+            match e {
+                Event::Governor => self.governor = self.next_active_after(self.governor),
+                Event::Down(id) => {
+                    if let Some(i) = self.idx(id) {
+                        self.nodes[i].up = false;
+                    }
+                    if self.governor == id {
+                        self.governor = self.next_active_after(id);
                     }
                 }
-                if self.governor == victim {
-                    self.governor = self.next_live_after(victim);
+                Event::Up(id) => {
+                    if let Some(i) = self.idx(id) {
+                        self.nodes[i].up = true;
+                    }
                 }
-            }
-        }
-        if self.p.join_at == Some(self.now) {
-            let new_id = self.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
-            let live: Vec<u32> = self
-                .nodes
-                .iter()
-                .filter(|n| n.alive)
-                .map(|n| n.id)
-                .collect();
-            let tree = fresh_tree(new_id, &live, self.p.fanout, &mut self.rng);
-            self.nodes.push(Node {
-                id: new_id,
-                tree,
-                usage: BCounter::new(new_id, 0),
-                alive: true,
-            });
-            for n in &mut self.nodes {
-                if n.alive && n.id != new_id {
-                    n.tree.membership(&[new_id], &[]);
+                Event::Leave(id) => {
+                    if let Some(i) = self.idx(id) {
+                        self.nodes[i].member = false;
+                    }
+                    for n in &mut self.nodes {
+                        if n.active() {
+                            n.tree.membership(&[], &[id]);
+                        }
+                    }
+                    if self.governor == id {
+                        self.governor = self.next_active_after(id);
+                    }
+                }
+                Event::Join => {
+                    let new_id = self.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+                    let peers: Vec<u32> = self
+                        .nodes
+                        .iter()
+                        .filter(|n| n.member)
+                        .map(|n| n.id)
+                        .collect();
+                    let tree = fresh_tree(new_id, &peers, self.p.fanout, &mut self.rng);
+                    self.nodes.push(Node {
+                        id: new_id,
+                        tree,
+                        usage: BCounter::new(new_id, 0),
+                        member: true,
+                        up: true,
+                    });
+                    for n in &mut self.nodes {
+                        if n.active() && n.id != new_id {
+                            n.tree.membership(&[new_id], &[]);
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn next_live_after(&self, id: u32) -> u32 {
+    fn next_active_after(&self, id: u32) -> u32 {
         self.nodes
             .iter()
-            .filter(|n| n.alive && n.id != id)
+            .filter(|n| n.active() && n.id != id)
             .map(|n| n.id)
             .next()
             .unwrap_or(id)
@@ -293,11 +335,11 @@ impl World {
         self.true_total <= self.p.limit + self.p.delta
     }
 
-    /// Every live node's view of the global usage equals the truth.
+    /// Every reachable member's view of the global usage equals the truth.
     fn converged(&self) -> bool {
         self.nodes
             .iter()
-            .filter(|n| n.alive)
+            .filter(|n| n.active())
             .all(|n| n.usage.global_used() == self.true_total)
     }
 
@@ -311,15 +353,14 @@ impl World {
 /// A tree for `me`: `fanout` random eager peers from `others`, the rest lazy.
 fn fresh_tree(me: u32, others: &[u32], fanout: usize, rng: &mut Rng) -> Plumtree<u32> {
     let mut peers: Vec<u32> = others.iter().copied().filter(|&p| p != me).collect();
-    // Shuffle (Fisher-Yates) for a random eager subset.
     for i in (1..peers.len()).rev() {
         peers.swap(i, rng.below(i + 1));
     }
     let cut = fanout.min(peers.len());
     let eager = peers[..cut].to_vec();
     let lazy = peers[cut..].to_vec();
-    // The sim's clock ticks once per round, so the GRAFT timeout is in rounds, not the
-    // 500ms default -- otherwise lazy repair never fires within a run.
+    // The sim's clock ticks once per round, so the GRAFT timeout is in rounds, not the 500ms
+    // default -- otherwise lazy repair never fires within a run.
     let cfg = Config {
         graft_timeout: 3,
         cache_cap: 4096,
@@ -340,18 +381,37 @@ fn base(loss: f64) -> Params {
         load_amount: 50,
         load_until: 200,
         rounds: 400,
-        change_governor_at: None,
-        kill_at: None,
-        join_at: None,
+        events: Vec::new(),
         seed: 0xB0A710,
+    }
+}
+
+/// A full lifecycle: a node goes down and comes back, the governor changes twice, a node joins,
+/// another leaves. Load runs 1..200; everything is timed so each departed or downed node's usage
+/// has spread before it goes (a node dying mid-load would leave an un-gossiped tail that only
+/// durable per-node usage recovers -- which this sim does not model).
+fn lifecycle(loss: f64) -> Params {
+    Params {
+        rounds: 500,
+        events: vec![
+            (50, Event::Down(5)),    // node 5 unreachable during load
+            (90, Event::Governor),   // leader change while 5 is down
+            (130, Event::Up(5)),     // node 5 returns, catches up, resumes load
+            (160, Event::Join),      // a new node joins mid-load
+            (250, Event::Down(8)),   // a transient failure in the quiet phase
+            (300, Event::Governor),  // another leader change
+            (350, Event::Up(8)),     // node 8 returns
+            (400, Event::Leave(12)), // node 12 leaves for good, its usage long since spread
+        ],
+        ..base(loss)
     }
 }
 
 fn main() {
     println!("bcounter + plumtree over a surrogate network (16 nodes, quota Y=1_000_000)");
-    println!("  load runs to round 200, then 200 quiet rounds; gossip carries full state\n");
+    println!("  load runs to round 200, then quiet rounds; gossip carries full state\n");
     println!(
-        "  {:>10}  {:>12}  {:>12}  {:>11}  {:>10}",
+        "  {:>10}  {:>12}  {:>12}  {:>11}  {:>16}",
         "loss", "enforced?", "converged?", "usage %Y", "scenario"
     );
 
@@ -359,17 +419,18 @@ fn main() {
     let scenarios: &[(&str, Mk)] = &[
         ("steady", base),
         ("governor change", |l| Params {
-            change_governor_at: Some(120),
+            events: vec![(120, Event::Governor)],
             ..base(l)
         }),
         ("node leaves", |l| Params {
-            kill_at: Some((250, 7)),
+            events: vec![(250, Event::Leave(7))],
             ..base(l)
         }),
         ("node joins", |l| Params {
-            join_at: Some(120),
+            events: vec![(120, Event::Join)],
             ..base(l)
         }),
+        ("full lifecycle", lifecycle),
     ];
 
     for &(name, mk) in scenarios {
@@ -377,7 +438,7 @@ fn main() {
             let mut w = World::new(mk(loss));
             w.run_to_end();
             println!(
-                "  {:>9.0}%  {:>12}  {:>12}  {:>10.1}%  {:>10}",
+                "  {:>9.0}%  {:>12}  {:>12}  {:>10.1}%  {:>16}",
                 loss * 100.0,
                 yesno(w.enforcement_holds()),
                 yesno(w.converged()),
@@ -387,9 +448,10 @@ fn main() {
         }
     }
     println!(
-        "\n  Read: usage stays within the quota (enforced), and every live node's view converges\n  \
-         to the true total -- through 30% message loss, a governor change, and a node joining or\n  \
-         leaving. Convergence rests on re-broadcasting full state, not on any message arriving."
+        "\n  Read: usage stays within the quota (enforced), and every reachable member's view\n  \
+         converges to the true total -- through 30% message loss and a full lifecycle of leader\n  \
+         changes, a node down and back up, a join, and a leave. Convergence rests on\n  \
+         re-broadcasting full state, not on any message arriving."
     );
 }
 
@@ -449,35 +511,20 @@ mod tests {
     }
 
     #[test]
-    fn survives_a_governor_change() {
-        let p = Params {
-            change_governor_at: Some(120),
-            ..base(0.1)
-        };
-        let w = run(p);
-        assert!(w.converged());
-        assert!(w.enforcement_holds());
-    }
-
-    #[test]
-    fn survives_a_node_leaving() {
-        let p = Params {
-            kill_at: Some((250, 7)),
-            ..base(0.1)
-        };
-        let w = run(p);
-        assert!(w.converged(), "did not converge after a node left");
-        assert!(w.enforcement_holds());
-    }
-
-    #[test]
-    fn survives_a_node_joining() {
-        let p = Params {
-            join_at: Some(120),
-            ..base(0.1)
-        };
-        let w = run(p);
-        assert!(w.converged(), "did not converge after a node joined");
-        assert!(w.enforcement_holds());
+    fn full_lifecycle_stays_enforced_and_converges() {
+        // Leader changes, a node down and back up, a join and a leave -- all in one run, under
+        // loss.
+        for &loss in &[0.0, 0.1, 0.3] {
+            let w = run(lifecycle(loss));
+            assert!(
+                w.enforcement_holds(),
+                "lifecycle exceeded the ceiling at {loss} loss"
+            );
+            assert!(
+                w.converged(),
+                "lifecycle did not converge at {loss} loss: true_total={}",
+                w.true_total
+            );
+        }
     }
 }
