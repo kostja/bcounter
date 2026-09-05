@@ -1,7 +1,7 @@
 # bcounter
 
 An escrow bounded counter for distributed capacity quotas, plus a map of them for hierarchical
-(path) quotas and the allocator trait that feeds them. Pure, `#![forbid(unsafe_code)]`, no
+(path) quotas and the quota trait that feeds them. Pure, `#![forbid(unsafe_code)]`, no
 network, no clock. This is the escrow (reservation) design of the [bounded counter][balegas] of
 Balegas et al., which descends from O'Neil's escrow transactional method.
 
@@ -9,7 +9,7 @@ Enforce *"no more than `limit` in total"* — bytes stored, objects held, connec
 across a cluster where every node accepts writes, without a round trip on the write path.
 
 > **What this crate is:** the data structures — [`BCounter`], [`BCounterMap`] — and the [`Quota`]
-> trait the allocator must satisfy. The allocator itself is not here. It needs durability, a
+> trait the server's quota must satisfy. That quota is not here. It needs durability, a
 > clock for lease expiry, and a rebalancing policy, so it belongs to the server that embeds this
 > crate. A minimal [`LocalQuota`] is included for tests and examples. The lease, Plumtree, and
 > adaptive-gossip parts of [The model](#the-model) marked *(planned)* are where that server is
@@ -53,9 +53,9 @@ assert_eq!(a.local_available(), 25);
 The node id is generic (`BCounter<Id>`, default `u32` — a Raft node id, a member uuid, any
 `Ord + Clone`).
 
-### The allocator contract
+### The quota contract
 
-The quota is not in this crate, but its contract is. Any allocator implements [`Quota`]:
+The quota is not in this crate, but its contract is. The server's quota implements [`Quota`]:
 
 ```rust
 pub trait Quota<Id> {

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Konstantin Osipov.
 
-//! The allocator contract, and a reference implementation for tests.
+//! The quota contract, and a reference implementation for tests.
 //!
-//! The real allocator is not in this crate. It has to survive leader changes (keep a ledger of
+//! The real quota is not in this crate. It has to survive leader changes (keep a ledger of
 //! outstanding grants that outlives a failover, or a new leader lends budget that is already
 //! out), use a clock for lease expiry, and decide when to move grants between nodes. All of that
 //! belongs to the server that embeds this crate. The crate defines only the contract: the
