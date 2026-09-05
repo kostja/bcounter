@@ -193,7 +193,7 @@ impl World {
     /// Drain a node's plumtree outbound queue and run it.
     fn pump(&mut self, i: usize) {
         let id = self.nodes[i].id;
-        let actions = self.nodes[i].tree.take_outbound();
+        let actions = self.nodes[i].tree.ready();
         self.run(id, actions);
     }
 
@@ -228,7 +228,7 @@ impl World {
         for m in due {
             if let Some(i) = self.idx(m.dst) {
                 if self.nodes[i].active() {
-                    self.nodes[i].tree.on_message(self.now, m.from, m.msg);
+                    self.nodes[i].tree.on_message(m.from, m.msg);
                     self.pump(i);
                 }
             }
@@ -244,7 +244,7 @@ impl World {
             }
             if self.now.is_multiple_of(self.p.gossip_every) {
                 let bytes = encode(&self.nodes[i].usage.delta());
-                self.nodes[i].tree.broadcast(self.now, bytes);
+                self.nodes[i].tree.broadcast(bytes);
                 self.pump(i);
             }
         }
@@ -252,7 +252,7 @@ impl World {
         // Tick every active node's tree.
         for i in 0..self.nodes.len() {
             if self.nodes[i].active() {
-                self.nodes[i].tree.tick(self.now);
+                self.nodes[i].tree.tick(1);
                 self.pump(i);
             }
         }
@@ -688,7 +688,7 @@ mod tests {
         w.nodes[i0].usage.acquire(777).unwrap();
         w.true_total += 777;
         let bytes = encode(&w.nodes[i0].usage.delta());
-        w.nodes[i0].tree.broadcast(w.now, bytes);
+        w.nodes[i0].tree.broadcast(bytes);
         w.pump(i0);
 
         // Count rounds until every node has it.
