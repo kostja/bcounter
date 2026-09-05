@@ -1,0 +1,19 @@
+[package]
+name = "bcounter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.63"
+license = "MIT OR Apache-2.0"
+description = "A bounded counter (BCounter) CRDT for distributed capacity quotas, plus a map of them for hierarchical (path) quotas."
+repository = "https://github.com/kostja/bcounter"
+homepage = "https://github.com/kostja/bcounter"
+documentation = "https://docs.rs/bcounter"
+readme = "README.md"
+keywords = ["crdt", "counter", "quota", "distributed", "bounded"]
+categories = ["data-structures", "concurrency"]
+authors = ["Konstantin Osipov <kostja.osipov@gmail.com>"]
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
