@@ -8,12 +8,19 @@ Balegas et al., which descends from O'Neil's escrow transactional method.
 Enforce *"no more than `limit` in total"* — bytes stored, objects held, connections open —
 across a cluster where every node accepts writes, without a round trip on the write path.
 
-> **What this crate is:** the data structures — [`BCounter`], [`BCounterMap`] — and the [`Quota`]
-> trait the server's quota must satisfy. That quota is not here. It needs durability, a
-> clock for lease expiry, and a rebalancing policy, so it belongs to the server that embeds this
-> crate. A minimal [`LocalQuota`] is included for tests and examples.
+It is the first of three small crates that together do that:
 
-## Data structure
+- `bcounter` does the accounting: a node's grant, and a usage map that merges by node id.
+- [`plumtree-fsm`](https://github.com/kostja/plumtree) is the overlay: it tells a node which
+  peer is upstream, towards the leader.
+- [`leasetree`](https://github.com/kostja/leasetree) is the protocol: leases handed down a tree
+  rooted at the leader, usage reported up, everything TTL'd and fenced by the leader's term.
+
+> **What this crate is:** the data structures — [`BCounter`], [`BCounterMap`] — and the [`Quota`]
+> trait a lender must satisfy. The lender is not here: `leasetree` is one, the tree of leases;
+> a minimal [`LocalQuota`] is included for tests and examples.
+
+## How it works
 
 A `Quota` holds the global budget. It lends slices of it, called grants, to nodes. A node
 acquires only against the rights it holds. The check is local; it needs no view of other nodes:
@@ -28,10 +35,11 @@ The quota keeps one rule: `Σ grants ≤ limit`. Each node's usage is capped by 
 The cost is the false denial. A node that has used up its grant must refuse a write, even when
 another node holds unused quota, until the quota moves a grant across.
 
-Each `BCounter` also keeps a gossiped view of every node's usage. The view is a grow-only CRDT,
-merged by taking the larger value in each slot (idempotent, commutative, associative; laws
-proven by `proptest`). It lets any node read the cluster-wide usage, for metrics and for the
-quota's rebalancing decisions.
+Each `BCounter` also keeps a map of every node's usage it has heard of: its own slot, and the
+slots reported to it. The map is a grow-only CRDT, merged by taking the larger value in each
+slot (idempotent, commutative, associative; laws proven by `proptest`). Merged up a tree, it
+gives the root the cluster-wide usage, exact, with no node counted twice however the tree
+moves.
 
 ```rust
 use bcounter::{BCounter, LocalQuota, Quota};
@@ -88,19 +96,22 @@ assert_eq!(m.global_used(&"tenant"), 40);
 
 ### Reporting usage
 
-`bcounter` holds the state; it does not move it. A node reports its slot to the governor, which
-uses the reports to decide when to move unused rights from an idle node to a busy one. The
-cluster-wide total is a metrics concern (Grafana), not something any node needs: enforcement is
-local against the lease. Two plain methods carry a report, with no wire format of their own:
+`bcounter` holds the state; it does not move it. Two plain methods carry a report, with no wire
+format of their own:
 
 - `delta() -> Vec<(node, acquired, released)>` — this node's slots, as plain tuples (encode them
   however you like)
 - `apply(&[(node, acquired, released)])` — merge a report: per-slot max, idempotent
 
+This is what `leasetree` sends up the tree: a child reports its `delta()`, the parent
+`apply`s it, and reports its own merged `delta()` to its parent in turn. The leader's
+`global_used()` is the cluster's total, exact up to report lag. Enforcement never reads it: a
+node admits a write against its own lease. The total is for metrics, for the audit, and for
+the leader's decisions on where quota should go.
+
 Usage is not gossiped node-to-node. The `gossip-sim` crate in this repository does flood
-`delta`/`apply` state over [`plumtree-fsm`](https://github.com/kostja/plumtree), but as a
-transport test of that library -- convergence under message loss and churn -- not as the quota
-design.
+`delta`/`apply` state over `plumtree-fsm`, but as a transport test of that library --
+convergence under message loss and churn -- not as the quota design.
 
 ## In numbers: when is it accurate enough?
 
@@ -108,19 +119,21 @@ Two different questions hide behind "accuracy". They have different answers.
 
 ### The limit itself: exact, always
 
-A node never spends past its lease, and the governor never lends past the limit. So the cluster
-never exceeds the limit -- at any cluster size, gossip rate, or load. Overshoot is zero by
-construction, and the simulator measures 0.00 at every setting. This part needs no gossip: a
-node admits a write against its local lease, and refills from the governor when short.
+A node never spends past its lease, and the leader never lends past the limit. So the cluster
+never exceeds the limit -- at any cluster size, message rate, or load. Overshoot is zero by
+construction, and every simulator in this repository measures 0.00 at every setting. This part
+needs no gossip: a node admits a write against its local lease, and asks for more when short.
 
 ### False denials: the price of no overshoot
 
-A write is refused only when this node's lease is dry *and* the governor has nothing left -- the
+A write is refused only when this node's lease is dry *and* the lender has nothing left -- the
 quota is truly exhausted, or rights are stranded in idle nodes' leases. Away from the limit this
-does not happen: a dry node simply refills. Near the limit, in the simulator, with each node
+does not happen: a dry node simply refills. Near the limit, in the `sim` crate, with each node
 holding a fair-share chunk (Y/N) and no rebalancing, about 10% of attempts were refused while
 quota sat elsewhere. A finer chunk trims that; an overshoot allowance Δ of 5% cuts it to about
-2%, and 25% to under 1%.
+2%, and 25% to under 1%. `leasetree` runs at Δ = 0 and gets its false denials down another
+way: idle nodes hand back what they hold beyond two chunks, and demand is forwarded up the
+tree at once.
 
 ---
 
@@ -204,21 +217,23 @@ gossip message.
 
 ### Enforcement architecture
 
-`BCounter` and `Quota` are the mechanism. The server adds the policy:
+`BCounter` and `Quota` are the mechanism. `leasetree` adds the policy, and it is what the
+model above led to:
 
-- **Hierarchical leases over a broadcast tree.** A [Plumtree][plumtree] tree, built from the Raft
-  membership and repaired by lazy-push, carries the grants. The root owns the quota; each parent
-  sub-lends to its subtree. The tree cuts the √N cost to per-level fan-out, and puts the
-  high-frequency work on the busiest link, the root.
-- **Fenced, expiring leases.** A lease holder gives up its grant a little before the grantor
-  takes it back, so a take-back never double-lends (which would overshoot). A lease TTL longer
-  than the tree-repair time reclaims a dead subtree's grant on its own. The ledger of outstanding
-  grants is Raft-durable, so a leader change never re-lends budget.
-- **A fixed operating point with event-triggered correction.** Pick a conservative point offline
-  (for example, a lease of about the fair share, assuming about 50% use by a cooperative user).
-  Top up at the cadence the frequency law gives. When a node's lease runs low ahead of schedule,
-  it triggers an early top-up. There is no continuous control loop; feedback happens only on that
-  exception.
+- **Leases down a tree, usage up it.** The tree follows the overlay `plumtree-fsm` maintains
+  and roots at the Raft leader. The leader holds the whole limit and lends chunks to its
+  children; each child lends out of what it holds. The tree cuts the √N cost to per-level
+  fan-out, and puts the high-frequency work on the busiest link, the root. Usage comes back up
+  as the merged `delta()` map, so the leader's total is exact.
+- **Leases with a TTL, fenced by the term.** A lease is dated from the tick its request was
+  sent and is good for `ttl`; a child renews at `ttl / 2`, and a lease not renewed lapses at
+  the parent and is dropped by the child at once. A grant carries the leader's Raft term, and a
+  lease is spendable only once confirmed in the current term, so a deposed leader's grants die
+  with it. Nothing about leases is persisted: only each node's own usage is durable, and the
+  leader's bookings are rebuilt from reports after a change.
+- **On demand, with a floor.** A node asks for a chunk when it runs short and hands back what
+  it holds beyond two chunks when idle; there is no control loop. A parent that cannot fill a
+  request forwards it and pushes room down as soon as it arrives.
 
 ### Threat model
 
@@ -230,11 +245,19 @@ coordinate per write on the counter that is near full. That is a separate case, 
 ## Scope
 
 This crate is the data structures: `BCounter`, `BCounterMap`, the `Quota` trait, and the
-reference `LocalQuota`. The durable, lease-based quota with its Raft-backed ledger, the failure
-detector, and the transport belong to the server that embeds it. The `sim/` crate is a
-discrete-event simulator that drives the real `BCounter` and measures overshoot and false
-denial against the formulas above. It confirms overshoot is exactly zero at `Δ = 0` and at most
-`Δ` otherwise, and that false denials fall with a finer lease or a larger `Δ`.
+reference `LocalQuota`. The lease protocol is `leasetree`, the overlay is `plumtree-fsm`, and
+the failure detector, the durable usage table and the transport belong to the server that
+embeds them. Three simulators live in this repository, none published:
+
+- `sim` drives a `BCounter` per node against a `LocalQuota` and measures overshoot and false
+  denial against the formulas above: overshoot is exactly zero at `Δ = 0` and at most `Δ`
+  otherwise, and false denials fall with a finer chunk or a larger `Δ`.
+- `gossip-sim` floods `delta`/`apply` state over `plumtree-fsm` under loss and churn, as a
+  transport test of that library.
+- `lease-sim` runs `leasetree` over `plumtree-fsm` the way a server would, with a surrogate
+  network, Raft's view arriving late, a failure detector, a load and two data centres, and
+  measures a leader change, a mid-tree outage, joins, and cross-DC traffic. Its driver is the
+  reference for embedding the three crates.
 
 ## References
 
