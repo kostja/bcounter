@@ -21,9 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use leasetree::{
-    Action as LAction, Config as LConfig, Lease, Limit, LimitKind, Message as LMessage,
-};
+use leasetree::{Action as LAction, Config as LConfig, Lease, Limit, Message as LMessage};
 use plumtree_fsm::{Action as PAction, Config as PConfig, Message as PMessage, Plumtree};
 
 type Id = u32;
@@ -251,16 +249,16 @@ impl World {
         let mut lease = Lease::new(id, LConfig { ttl: p.ttl });
         lease.set_limit(
             BYTES,
-            Limit {
-                kind: LimitKind::Stock,
+            Limit::Stock {
                 limit: p.limit,
                 chunk: p.chunk,
+                acquired: 0,
+                released: 0,
             },
         );
         lease.set_limit(
             RPS,
-            Limit {
-                kind: LimitKind::Rate,
+            Limit::Rate {
                 limit: p.rate,
                 chunk: p.offered,
             },
