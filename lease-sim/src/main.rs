@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use leasetree::{Action as LAction, Config as LConfig, Lease, Limit, Message as LMessage};
+use leasetree::{Action as LAction, Config as LConfig, Lease, LeaseRequest, LeaseResponse, Limit};
 use plumtree_fsm::{Action as PAction, Config as PConfig, Message as PMessage, Plumtree};
 
 type Id = u32;
@@ -52,7 +52,8 @@ impl Rng {
 
 enum Wire {
     Plum(PMessage<Id>),
-    Lease(LMessage<Id, Key>),
+    Call(LeaseRequest<Id, Key>),
+    Reply(LeaseResponse<Id, Key>),
 }
 
 struct Pending {
@@ -292,7 +293,7 @@ impl World {
     fn send(&mut self, from: Id, dst: Id, msg: Wire) {
         let cross = self.nodes[self.idx(from).unwrap()].dc != self.nodes[self.idx(dst).unwrap()].dc;
         match msg {
-            Wire::Lease(_) => {
+            Wire::Call(_) | Wire::Reply(_) => {
                 self.lease_msgs += 1;
                 self.cross_lease_msgs += u64::from(cross);
             }
@@ -346,9 +347,9 @@ impl World {
     fn pump_lease(&mut self, i: usize) {
         let id = self.nodes[i].id;
         let up = self.nodes[i].active();
-        for LAction::Send(peer, m) in self.nodes[i].lease.ready() {
+        for LAction::Call(peer, req) in self.nodes[i].lease.ready() {
             if up {
-                self.send(id, peer, Wire::Lease(m));
+                self.send(id, peer, Wire::Call(req));
             }
         }
     }
@@ -437,8 +438,13 @@ impl World {
                     }
                     self.pump(i, Some(m.from));
                 }
-                Wire::Lease(lm) => {
-                    self.nodes[i].lease.on_message(m.from, lm);
+                Wire::Call(req) => {
+                    let resp = self.nodes[i].lease.on_request(m.from, req);
+                    self.send(m.dst, m.from, Wire::Reply(resp));
+                    self.pump_lease(i);
+                }
+                Wire::Reply(resp) => {
+                    self.nodes[i].lease.on_response(m.from, resp);
                     self.pump_lease(i);
                 }
             }
