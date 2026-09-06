@@ -14,7 +14,7 @@ cargo test -p lease-sim --release  # the invariants
 
 ## What it measures
 
-Over cluster sizes 10/50/200, TTLs 10/40, both policies and five seeds. Bounds (overshoot,
+Over cluster sizes 10/50/200, TTLs 10/40 and five seeds. Bounds (overshoot,
 over-booking) are the worst seed; costs are the mean.
 
 - **(a) a leader change**: overshoot, peak over-booking, false denials beyond a no-event
@@ -27,10 +27,10 @@ over-booking) are the worst seed; costs are the mean.
 
 ## Reading the numbers
 
-Neither policy overshoots in any scenario. Over-booking peaks during a re-orientation, because
+The stock never overshoots in any scenario. Over-booking peaks during a re-orientation, because
 a moving lease is booked by both parents until the new one confirms; it is transient and not a
-spending risk. The policies differ in false denials: `deny` refuses two to three times as many
-writes as `allow`.
+spending risk. The rate is admitted while a node is unleased, so a subtree's flow never stalls
+when its parent dies; it dips only for the few ticks a node spends re-leased at zero.
 
 The tree's depth is `log2 N`-ish with an eager fanout of `log2 N + 1`, and returns there within
 a few of the leader's messages after a change. Only `gateways` nodes per data centre list a

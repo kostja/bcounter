@@ -8,7 +8,7 @@
 //! with a delay, a failure detector with a delay, a load, and the measurements. The node logic
 //! lives in the two crates; nothing here decides anything about leases.
 //!
-//! Measured, over cluster sizes, TTLs, policies and seeds:
+//! Measured, over cluster sizes, TTLs and seeds:
 //!
 //!   (a) a leader change: overshoot, over-booking, the false denials it caused, how long the
 //!       new leader's total takes to catch up, how deep the tree got and how fast it
@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use leasetree::{
-    Action as LAction, Config as LConfig, Kind, Lease, Limit, Message as LMessage, Policy,
+    Action as LAction, Config as LConfig, Lease, Limit, LimitKind, Message as LMessage,
 };
 use plumtree_fsm::{Action as PAction, Config as PConfig, Message as PMessage, Plumtree};
 
@@ -116,7 +116,6 @@ struct Params {
     chunk: u64,
     rate: u64,
     offered: u64,
-    allow: bool,
     /// How often the leader sends something over the overlay.
     leader_period: u64,
     /// How long Raft's view takes to reach a node, and the failure detector its verdict.
@@ -250,12 +249,10 @@ impl World {
             ..PConfig::default()
         };
         let mut lease = Lease::new(id, LConfig { ttl: p.ttl });
-        let policy = if p.allow { Policy::Allow } else { Policy::Deny };
         lease.set_limit(
             BYTES,
             Limit {
-                kind: Kind::Stock,
-                policy,
+                kind: LimitKind::Stock,
                 limit: p.limit,
                 chunk: p.chunk,
             },
@@ -263,8 +260,7 @@ impl World {
         lease.set_limit(
             RPS,
             Limit {
-                kind: Kind::Flow,
-                policy,
+                kind: LimitKind::Rate,
                 limit: p.rate,
                 chunk: p.offered,
             },
@@ -753,7 +749,7 @@ impl World {
 
 const EVENT_AT: u64 = 300;
 
-fn base(nodes: u32, ttl: u64, allow: bool) -> Params {
+fn base(nodes: u32, ttl: u64) -> Params {
     // Eager fanout about log2 N + 1, as the paper suggests; a fanout of 3 at N = 200 gives a
     // tree a dozen deep, and then a cross-domain shortcut looks worth ten hops.
     let fanout = (f64::from(nodes).log2().ceil() as usize + 1).max(3);
@@ -772,7 +768,6 @@ fn base(nodes: u32, ttl: u64, allow: bool) -> Params {
         chunk: 2_000_000 / u64::from(nodes) / 4,
         rate: 3 * u64::from(nodes),
         offered: 2,
-        allow,
         leader_period: 5,
         view_delay: 3,
         fd_delay: 5,
@@ -782,36 +777,36 @@ fn base(nodes: u32, ttl: u64, allow: bool) -> Params {
     }
 }
 
-fn leader_change(nodes: u32, ttl: u64, allow: bool) -> Params {
+fn leader_change(nodes: u32, ttl: u64) -> Params {
     Params {
         events: vec![(EVENT_AT, Event::Leader)],
-        ..base(nodes, ttl, allow)
+        ..base(nodes, ttl)
     }
 }
 
-fn mid_tree_outage(nodes: u32, ttl: u64, allow: bool) -> Params {
+fn mid_tree_outage(nodes: u32, ttl: u64) -> Params {
     Params {
         events: vec![
             (EVENT_AT - 20, Event::PickMidTree),
             (EVENT_AT, Event::DownMidTree),
             (EVENT_AT + 4 * ttl, Event::UpMidTree),
         ],
-        ..base(nodes, ttl, allow)
+        ..base(nodes, ttl)
     }
 }
 
-fn joins(nodes: u32, ttl: u64, allow: bool) -> Params {
+fn joins(nodes: u32, ttl: u64) -> Params {
     Params {
         events: (0..5).map(|k| (EVENT_AT + k * 3, Event::Join)).collect(),
-        ..base(nodes, ttl, allow)
+        ..base(nodes, ttl)
     }
 }
 
-fn two_dcs(nodes: u32, ttl: u64, allow: bool) -> Params {
+fn two_dcs(nodes: u32, ttl: u64) -> Params {
     Params {
         dcs: 2,
         events: vec![(EVENT_AT, Event::Leader)],
-        ..base(nodes, ttl, allow)
+        ..base(nodes, ttl)
     }
 }
 
@@ -872,14 +867,6 @@ fn flow_summary(w: &World, pick_at: u64, down_at: u64) -> Option<Flow> {
     })
 }
 
-fn policy(allow: bool) -> &'static str {
-    if allow {
-        "allow"
-    } else {
-        "deny"
-    }
-}
-
 fn opt(v: Option<f64>) -> String {
     v.map_or("-".to_string(), |t| format!("{t:.0}"))
 }
@@ -919,7 +906,7 @@ struct Cell {
     cross_edges: f64,
 }
 
-fn event_cell(mk: fn(u32, u64, bool) -> Params, n: u32, ttl: u64, allow: bool) -> Cell {
+fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
     let mut over = vec![];
     let mut booked = vec![];
     let mut fd = vec![];
@@ -932,15 +919,12 @@ fn event_cell(mk: fn(u32, u64, bool) -> Params, n: u32, ttl: u64, allow: bool) -
     let mut xp = vec![];
     let mut xe = vec![];
     for &seed in &SEEDS {
-        let mut w = World::new(Params {
-            seed,
-            ..mk(n, ttl, allow)
-        });
+        let mut w = World::new(Params { seed, ..mk(n, ttl) });
         w.run_to_end();
         let mut c = World::new(Params {
             seed,
             dcs: w.p.dcs,
-            ..base(n, ttl, allow)
+            ..base(n, ttl)
         });
         c.run_to_end();
         let (a, b) = window(ttl);
@@ -985,10 +969,9 @@ fn main() {
 
     println!("(a) leader change at tick {EVENT_AT}");
     println!(
-        "  {:>4} {:>4} {:>6} {:>10} {:>11} {:>10} {:>8} {:>12} {:>11}",
+        "  {:>4} {:>4} {:>10} {:>11} {:>10} {:>8} {:>12} {:>11}",
         "N",
         "TTL",
-        "policy",
         "overshoot",
         "overbooked",
         "+false-den",
@@ -998,13 +981,12 @@ fn main() {
     );
     for &n in &[10u32, 50, 200] {
         for &ttl in &[10u64, 40] {
-            for &allow in &[true, false] {
-                let c = event_cell(leader_change, n, ttl, allow);
+            {
+                let c = event_cell(leader_change, n, ttl);
                 println!(
-                    "  {:>4} {:>4} {:>6} {:>9.3}% {:>10.1}% {:>10.0} {:>8} {:>5.0}/{:>2.0}/{:>3} {:>11.2}",
+                    "  {:>4} {:>4} {:>9.3}% {:>10.1}% {:>10.0} {:>8} {:>5.0}/{:>2.0}/{:>3} {:>11.2}",
                     n,
                     ttl,
-                    policy(allow),
                     c.overshoot,
                     c.overbooked,
                     c.false_den,
@@ -1022,10 +1004,9 @@ fn main() {
         "\n(b) a mid-tree node down at {EVENT_AT}, back 4 TTLs later: its subtree's rate flow"
     );
     println!(
-        "  {:>4} {:>4} {:>6} {:>5} {:>8} {:>6} {:>9} {:>8} {:>14} {:>11}",
+        "  {:>4} {:>4} {:>5} {:>8} {:>6} {:>9} {:>8} {:>14} {:>11}",
         "N",
         "TTL",
-        "policy",
         "trees",
         "baseline",
         "floor",
@@ -1036,14 +1017,14 @@ fn main() {
     );
     for &n in &[10u32, 50, 200] {
         for &ttl in &[10u64, 40] {
-            for &allow in &[true, false] {
+            {
                 let (mut base_, mut floor, mut after, mut len, mut fd, mut msgs) =
                     (vec![], vec![], vec![], vec![], vec![], vec![]);
                 let mut dipped = 0usize;
                 for &seed in &SEEDS {
                     let mut w = World::new(Params {
                         seed,
-                        ..mid_tree_outage(n, ttl, allow)
+                        ..mid_tree_outage(n, ttl)
                     });
                     w.run_to_end();
                     let Some(f) = flow_summary(&w, EVENT_AT - 20, EVENT_AT) else {
@@ -1068,10 +1049,9 @@ fn main() {
                     }
                 };
                 println!(
-                    "  {:>4} {:>4} {:>6} {:>5} {:>8.2} {:>6.2} {:>9} {:>8} {:>14.0} {:>11.2}",
+                    "  {:>4} {:>4} {:>5} {:>8.2} {:>6.2} {:>9} {:>8} {:>14.0} {:>11.2}",
                     n,
                     ttl,
-                    policy(allow),
                     base_.len(),
                     mean(&base_),
                     floor.iter().copied().fold(f64::INFINITY, f64::min),
@@ -1086,22 +1066,16 @@ fn main() {
 
     println!("\n(c) five joins from tick {EVENT_AT}: over-commit from lease adoption");
     println!(
-        "  {:>4} {:>4} {:>6} {:>11} {:>10} {:>10} {:>11}",
-        "N", "TTL", "policy", "overbooked", "overshoot", "+false-den", "msgs/node/t"
+        "  {:>4} {:>4} {:>11} {:>10} {:>10} {:>11}",
+        "N", "TTL", "overbooked", "overshoot", "+false-den", "msgs/node/t"
     );
     for &n in &[10u32, 50, 200] {
         for &ttl in &[10u64, 40] {
-            for &allow in &[true, false] {
-                let c = event_cell(joins, n, ttl, allow);
+            {
+                let c = event_cell(joins, n, ttl);
                 println!(
-                    "  {:>4} {:>4} {:>6} {:>10.1}% {:>9.3}% {:>10.0} {:>11.2}",
-                    n,
-                    ttl,
-                    policy(allow),
-                    c.overbooked,
-                    c.overshoot,
-                    c.false_den,
-                    c.msgs
+                    "  {:>4} {:>4} {:>10.1}% {:>9.3}% {:>10.0} {:>11.2}",
+                    n, ttl, c.overbooked, c.overshoot, c.false_den, c.msgs
                 );
             }
         }
@@ -1111,10 +1085,9 @@ fn main() {
         "\n(d) two data centres (latency 1 inside, 10 across), with a leader change at {EVENT_AT}"
     );
     println!(
-        "  {:>4} {:>4} {:>6} {:>10} {:>12} {:>12} {:>11} {:>14} {:>11}",
+        "  {:>4} {:>4} {:>10} {:>12} {:>12} {:>11} {:>14} {:>11}",
         "N",
         "TTL",
-        "policy",
         "overshoot",
         "cross lease",
         "cross plum",
@@ -1124,13 +1097,12 @@ fn main() {
     );
     for &n in &[50u32, 200] {
         for &ttl in &[40u64] {
-            for &allow in &[true, false] {
-                let c = event_cell(two_dcs, n, ttl, allow);
+            {
+                let c = event_cell(two_dcs, n, ttl);
                 println!(
-                    "  {:>4} {:>4} {:>6} {:>9.3}% {:>11.1}% {:>11.1}% {:>11.0} {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
+                    "  {:>4} {:>4} {:>9.3}% {:>11.1}% {:>11.1}% {:>11.0} {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
                     n,
                     ttl,
-                    policy(allow),
                     c.overshoot,
                     c.cross_lease,
                     c.cross_plum,
@@ -1164,7 +1136,7 @@ mod tests {
 
     #[test]
     fn steady_state_stays_within_the_limit_and_leases_everyone() {
-        let mut w = World::new(base(20, 20, true));
+        let mut w = World::new(base(20, 20));
         w.run_to_end();
         assert_eq!(w.peak_overshoot, 0);
         for n in w.nodes.iter().filter(|n| n.active() && n.id != w.leader) {
@@ -1184,7 +1156,7 @@ mod tests {
 
     #[test]
     fn the_leader_total_never_double_counts() {
-        let mut w = World::new(leader_change(60, 10, true));
+        let mut w = World::new(leader_change(60, 10));
         while w.now < w.p.rounds {
             w.step();
             let l = w.idx(w.leader).unwrap();
@@ -1199,43 +1171,32 @@ mod tests {
     }
 
     #[test]
-    fn deny_never_overshoots_on_a_leader_change() {
-        for &(n, ttl) in &[(20u32, 20u64), (100, 20), (200, 40)] {
-            let mut w = World::new(leader_change(n, ttl, false));
+    fn a_stock_never_overshoots_on_a_leader_change() {
+        for &(n, ttl) in &[(20u32, 20u64), (100, 20), (200, 10), (200, 40)] {
+            let mut w = World::new(leader_change(n, ttl));
             w.run_to_end();
             assert_eq!(w.peak_overshoot, 0, "N={n} TTL={ttl}");
         }
     }
 
     #[test]
-    fn allow_overshoot_on_a_leader_change_is_within_the_window_spend() {
-        let (n, ttl) = (20u32, 20u64);
-        let mut w = World::new(leader_change(n, ttl, true));
-        w.run_to_end();
-        let bound = u64::from(n) * w.p.load * (ttl + w.p.view_delay + w.p.leader_period);
-        assert!(w.peak_overshoot <= bound, "{} > {bound}", w.peak_overshoot);
-    }
-
-    #[test]
-    fn a_subtree_dips_under_deny_and_recovers() {
-        let mut w = World::new(mid_tree_outage(30, 20, false));
+    fn a_subtree_keeps_flowing_through_its_parent_s_outage() {
+        // A rate admits without a lease, so the subtree's flow never stalls, and it is back
+        // at baseline once re-leased.
+        let mut w = World::new(mid_tree_outage(30, 20));
         w.run_to_end();
         let f = flow_summary(&w, EVENT_AT - 20, EVENT_AT).expect("a mid-tree node at N=30");
-        assert!(f.baseline > 0.0);
-        assert!(
-            f.floor < f.baseline,
-            "floor {} baseline {}",
-            f.floor,
-            f.baseline
-        );
-        assert!(f.dip_after.is_some());
-        assert!(f.dip_len.is_some(), "never recovered");
+        assert!(f.baseline > 0.8, "baseline {}", f.baseline);
+        assert!(f.floor > 0.0, "the subtree stalled");
+        if f.dip_after.is_some() {
+            assert!(f.dip_len.is_some(), "never recovered");
+        }
     }
 
     #[test]
-    fn joins_never_overshoot_under_deny() {
-        for &(n, ttl) in &[(30u32, 20u64), (200, 40)] {
-            let mut w = World::new(joins(n, ttl, false));
+    fn joins_never_overshoot() {
+        for &(n, ttl) in &[(30u32, 20u64), (200, 10), (200, 40)] {
+            let mut w = World::new(joins(n, ttl));
             w.run_to_end();
             assert_eq!(w.peak_overshoot, 0, "N={n} TTL={ttl}");
         }
@@ -1243,7 +1204,7 @@ mod tests {
 
     #[test]
     fn the_tree_rebalances_after_a_leader_change() {
-        let mut w = World::new(leader_change(200, 40, false));
+        let mut w = World::new(leader_change(200, 40));
         w.run_to_end();
         let (before, _peak, back) = w.depth_recovery(EVENT_AT);
         assert!(back.is_some(), "the tree never came back to depth {before}");
@@ -1253,7 +1214,7 @@ mod tests {
 
     #[test]
     fn two_data_centres_are_joined_by_few_lease_edges() {
-        let mut w = World::new(two_dcs(50, 40, false));
+        let mut w = World::new(two_dcs(50, 40));
         w.run_to_end();
         let edges = w.cross_edges();
         assert!(
