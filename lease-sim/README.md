@@ -1,45 +1,42 @@
 # lease-sim
 
-A simulation of tree-leased quotas: [`bcounter`](..) for the accounting,
-[`plumtree-fsm`](https://github.com/kostja/plumtree) for the spanning tree, and the lease
-protocol the server will run on top of them. It is not published; it is the test bench for
-the design.
+The tree-leased quota, driven the way a server drives it. Every node runs a
+[`leasetree`](https://github.com/kostja/leasetree) `Lease` (the protocol) and a
+[`plumtree-fsm`](https://github.com/kostja/plumtree) `Plumtree` (the overlay). This crate is only
+the driver: a surrogate network with latency and loss, Raft's cluster view arriving with a delay,
+a failure detector with a delay, a load, and the measurements. Nothing here decides anything
+about leases; that is what makes it a preview of embedding the quotas in a server.
 
 ```
-cargo run -p lease-sim --release   # the three tables
+cargo run -p lease-sim --release   # the four tables
 cargo test -p lease-sim --release  # the invariants
 ```
 
-## What it models
-
-The tree roots at the governor. Leases flow down: capacity (bytes, a stock) and rate (a share
-of a refill, a flow). Usage flows up as a per-node map (`BCounter::delta`), merged at every
-level, so a moving branch is never counted twice. Every lease is TTL'd and epoch-fenced. The
-network loses 5% of messages. The rules the protocol needs are listed at the top of
-`src/main.rs`; each one was found by a run that went wrong without it.
-
 ## What it measures
 
-- **(a) a governor change**: overshoot, peak over-booking, false denials beyond a no-event
-  control, the new governor's window and catch-up time, and messages per node per tick.
-- **(b) a mid-tree node down and back**: when its subtree's flow drops, how far, for how long.
-- **(c) five joins**: the over-commit from lease adoption.
+Over cluster sizes 10/50/200, TTLs 10/40, both policies and five seeds. Bounds (overshoot,
+over-booking) are the worst seed; costs are the mean.
 
-Each cell runs over five seeds. Bounds (overshoot, over-booking) are the worst seed; costs
-are the mean.
+- **(a) a leader change**: overshoot, peak over-booking, false denials beyond a no-event
+  control, how long the new leader's total takes to catch up, how deep the tree got and how
+  fast it rebalanced, and lease messages per node per tick.
+- **(b) a mid-tree node down and back**: when its subtree's rate flow drops, how far, how long.
+- **(c) five joins**: the over-commit from lease adoption.
+- **(d) two data centres** at latency 1 inside and 10 across, with a leader change: the share
+  of lease and overlay traffic that crosses, and the number of tree edges that do.
 
 ## Reading the numbers
 
-With a well-shaped tree, neither policy overshoots on a governor change or a join: the new
-governor lends nothing until every old lease is booked again, and a moving lease is booked by
-both parents until the new one confirms. Over-booking peaks at 10–33% of the limit during a
-re-orientation and is transient.
+Neither policy overshoots in any scenario. Over-booking peaks during a re-orientation, because
+a moving lease is booked by both parents until the new one confirms; it is transient and not a
+spending risk. The policies differ in false denials: `deny` refuses two to three times as many
+writes as `allow`.
 
-The policies differ in false denials: `deny` refuses two to three times as many writes as
-`allow` after a governor change, and refuses a subtree's writes for tens of ticks after its
-parent dies. `allow` covers the unavailability gap but still throttles a node briefly once it
-is re-leased at zero.
+The tree's depth is `log2 N`-ish with an eager fanout of `log2 N + 1`, and returns there within
+a few of the leader's messages after a change. Only `gateways` nodes per data centre list a
+peer in another; that bounds the cross-DC tree edges by construction (2 per DC here), and the
+cost rules choose well among what remains: 3% of lease traffic and 0.2% of overlay traffic
+cross at N=200.
 
-Message cost is 0.3–1.7 lease messages per node per tick. The TTL sets it: `TTL=10` costs
-about three times `TTL=40`. The TTL also bounds every recovery time: a subtree's flow returns
-within a few TTLs; a lost message is covered by the next renewal at `TTL/2`.
+The driver in `src/main.rs` is the reference for the caller's side: what to feed the two state
+machines, from where, and when.

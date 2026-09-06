@@ -324,7 +324,7 @@ impl World {
                     });
                     for n in &mut self.nodes {
                         if n.active() && n.id != new_id {
-                            n.tree.membership(&[new_id], &[]);
+                            n.tree.membership(&[(new_id, 0)], &[]);
                         }
                     }
                 }
@@ -388,10 +388,11 @@ fn fresh_tree(me: u32, others: &[u32], fanout: usize, rng: &mut Rng) -> Plumtree
     // The sim's clock ticks once per round, so the GRAFT timeout is in rounds, not the 500ms
     // default -- otherwise lazy repair never fires within a run.
     let cfg = Config {
-        graft_timeout: 3,
+        graft_timeout: 8,
         cache_cap: 4096,
+        ..Config::default()
     };
-    Plumtree::new(me, eager, lazy, cfg)
+    Plumtree::with_split(me, eager, lazy, cfg)
 }
 
 fn base(loss: f64) -> Params {
