@@ -4,7 +4,7 @@
 //! The tree-leased rate limit, driven the way a server drives it.
 //!
 //! Every node runs a [`Lease`] (the protocol) and computes its place in the tree from the
-//! cluster view it holds ([`leasetree::tree::place`]). This file is only the driver: a
+//! cluster view it holds (`leasetree::tree::place`, a trie over the ids). This file is only the driver: a
 //! surrogate network with latency and loss, Raft's cluster view arriving with a delay, a
 //! failure detector with a delay, a load, and the measurements. The node logic lives in the
 //! crate; nothing here decides anything about shares or about the tree.
@@ -95,85 +95,13 @@ enum Event {
     UpMidTree,
 }
 
-/// The placement rule under test.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rule {
-    /// The crate's `tree::place`: a heap over the domain's members by rank.
-    Heap,
-    /// A trie over the ids themselves: `parent(x)` clears the lowest nonzero base-`fan_in`
-    /// digit of `x`, climbing over absent ids; the domain's lowest id is its root; the
-    /// leader's domain is re-rooted at the leader, which flips only the path between them.
-    Trie,
-}
-
-/// The trie rule. A node's position depends on its id alone, so a membership change moves
-/// only the nodes next to it, and a leader change only the path from the leader to the old
-/// root of its domain.
-fn place_trie(me: Id, leader: Id, members: &[(Id, u8)], k: usize) -> Option<Place<Id>> {
-    let k = k.max(2) as u32;
-    let dom = |id: Id| members.iter().find(|(x, _)| *x == id).map(|(_, d)| *d);
-    let my_dc = dom(me)?;
-    let leader_dc = dom(leader)?;
-    let present = |id: Id| members.iter().any(|(x, d)| *x == id && *d == my_dc);
-    let min = members
-        .iter()
-        .filter(|(_, d)| *d == my_dc)
-        .map(|(x, _)| *x)
-        .min()?;
-    // Clear the lowest nonzero base-k digit; the nearest present ancestor, else the min.
-    let trie_parent = |mut x: Id| -> Option<Id> {
-        if x == min {
-            return None;
-        }
-        loop {
-            let mut p = 1u32;
-            while (x / p).is_multiple_of(k) && p <= x {
-                p *= k;
-            }
-            if p > x {
-                return Some(min);
-            }
-            x -= (x / p % k) * p;
-            if present(x) {
-                return Some(x);
-            }
-            if x == 0 {
-                return Some(min);
-            }
-        }
-    };
-    if me == leader {
-        return Some(Place::Root);
-    }
-    if my_dc != leader_dc {
-        return Some(if me == min {
-            Place::Under(leader)
-        } else {
-            Place::Under(trie_parent(me)?)
-        });
-    }
-    // The leader's domain: the path from the leader up to the trie root flips direction.
-    let mut path = vec![leader];
-    let mut at = leader;
-    while let Some(p) = trie_parent(at) {
-        path.push(p);
-        at = p;
-    }
-    if let Some(i) = path.iter().position(|x| *x == me) {
-        return Some(Place::Under(path[i - 1]));
-    }
-    Some(Place::Under(trie_parent(me)?))
-}
-
 #[derive(Clone)]
 struct Params {
     nodes: u32,
     /// Data centres; node `i` is in `i % dcs`.
     dcs: u8,
-    /// Children per node inside a data centre.
-    fan_in: usize,
-    /// How a node's place is computed.
-    rule: Rule,
+    /// The tree's radix: ids are read as base-`radix` numbers.
+    radix: usize,
     loss: f64,
     latency: u64,
     cross_latency: u64,
@@ -245,13 +173,6 @@ impl World {
         w
     }
 
-    fn place_of(&self, id: Id, leader: Id, members: &[(Id, u8)]) -> Option<Place<Id>> {
-        match self.p.rule {
-            Rule::Heap => place(&id, &leader, members, self.p.fan_in),
-            Rule::Trie => place_trie(id, leader, members, self.p.fan_in),
-        }
-    }
-
     /// Bring a node's lease machine in line with the view it holds: the members it believes
     /// online, the leader and term, and its place in the tree those define.
     fn apply_view(&mut self, i: usize) {
@@ -264,7 +185,7 @@ impl World {
             .collect();
         let list: Vec<Id> = members.iter().map(|(id, _)| *id).collect();
         let (id, leader, term) = (n.id, n.seen_leader, n.seen_term);
-        let p = self.place_of(id, leader, &members);
+        let p = place(&id, &leader, &members, self.p.radix);
         let n = &mut self.nodes[i];
         n.lease.set_cluster_view(Some(&list), leader, term);
         if let Some(Place::Under(parent)) = p {
@@ -544,7 +465,7 @@ impl World {
             .iter()
             .filter(|n| {
                 matches!(
-                    self.place_of(n.id, self.leader, &members),
+                    place(&n.id, &self.leader, &members, self.p.radix),
                     Some(Place::Under(p)) if n.lease.parent() == Some(&p)
                 )
             })
@@ -700,8 +621,7 @@ fn base(nodes: u32, ttl: u64) -> Params {
     Params {
         nodes,
         dcs: 1,
-        fan_in: 4,
-        rule: Rule::Heap,
+        radix: 4,
         loss: 0.05,
         latency: 1,
         cross_latency: 10,
@@ -845,7 +765,7 @@ struct Cell {
     agreement: f64,
 }
 
-fn event_cell(mk: &dyn Fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
+fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
     let (mut over, mut util, mut ft, mut d_before, mut d_peak, mut d_back, mut msgs) =
         (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
     let (mut xl, mut xe, mut ag) = (vec![], vec![], vec![]);
@@ -891,7 +811,7 @@ fn event_cell(mk: &dyn Fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
 
 fn main() {
     println!(
-        "tree-leased rate limits: leasetree over a tree computed from the view, fan-in 4, 5% loss, \
+        "tree-leased rate limits: leasetree over a tree computed from the view, radix 4, 5% loss, \
          demand at 4/3 of the rate, {} seeds per row: bounds are the worst seed, costs the mean",
         SEEDS.len()
     );
@@ -904,32 +824,29 @@ fn main() {
         ),
         ("(c) five joins from tick 300", joins),
     ] {
-        for rule in [Rule::Heap, Rule::Trie] {
-            let mk = move |n, ttl| Params { rule, ..mk(n, ttl) };
-            println!("{title}, {rule:?}");
-            println!(
-                "  {:>4} {:>4} {:>10} {:>8} {:>11} {:>14} {:>11}",
-                "N", "TTL", "overshoot", "used", "+throttled", "depth b/p/back", "msgs/node/t"
-            );
-            for &n in &[10u32, 50, 200] {
-                for &ttl in &[10u64, 40] {
-                    let c = event_cell(&mk, n, ttl);
-                    println!(
-                        "  {:>4} {:>4} {:>9.1}% {:>7.0}% {:>11.0} {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
-                        n,
-                        ttl,
-                        c.overshoot,
-                        c.utilization,
-                        c.false_throttles,
-                        c.depth_before,
-                        c.depth_peak,
-                        opt(c.depth_back),
-                        c.msgs
-                    );
-                }
+        println!("{title}");
+        println!(
+            "  {:>4} {:>4} {:>10} {:>8} {:>11} {:>14} {:>11}",
+            "N", "TTL", "overshoot", "used", "+throttled", "depth b/p/back", "msgs/node/t"
+        );
+        for &n in &[10u32, 50, 200] {
+            for &ttl in &[10u64, 40] {
+                let c = event_cell(mk, n, ttl);
+                println!(
+                    "  {:>4} {:>4} {:>9.1}% {:>7.0}% {:>11.0} {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
+                    n,
+                    ttl,
+                    c.overshoot,
+                    c.utilization,
+                    c.false_throttles,
+                    c.depth_before,
+                    c.depth_peak,
+                    opt(c.depth_back),
+                    c.msgs
+                );
             }
-            println!();
         }
+        println!();
     }
 
     println!("(b) a mid-tree node down at {EVENT_AT}, back 4 TTLs later: its subtree's flow");
@@ -995,29 +912,22 @@ fn main() {
         "depth b/p/back",
         "msgs/node/t"
     );
-    for rule in [Rule::Heap, Rule::Trie] {
+    {
         for &n in &[50u32, 200] {
-            let c = event_cell(
-                &move |n, ttl| Params {
-                    rule,
-                    ..two_dcs(n, ttl)
-                },
+            let c = event_cell(two_dcs, n, 40);
+            println!(
+                "  {:>4} {:>4} {:>9.1}% {:>11.1}% {:>11.0} {:>7.0}% {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
                 n,
                 40,
+                c.overshoot,
+                c.cross_lease,
+                c.cross_edges,
+                c.agreement,
+                c.depth_before,
+                c.depth_peak,
+                opt(c.depth_back),
+                c.msgs
             );
-            println!(
-            "  {:>4} {:>4} {:>9.1}% {:>11.1}% {:>11.0} {:>7.0}% {:>7.0}/{:>2.0}/{:>3} {:>11.2}  {rule:?}",
-            n,
-            40,
-            c.overshoot,
-            c.cross_lease,
-            c.cross_edges,
-            c.agreement,
-            c.depth_before,
-            c.depth_peak,
-            opt(c.depth_back),
-            c.msgs
-        );
         }
     }
     println!(
