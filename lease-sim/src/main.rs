@@ -3,10 +3,11 @@
 
 //! The tree-leased rate limit, driven the way a server drives it.
 //!
-//! Every node runs a [`Lease`] (the protocol) and a [`Plumtree`] (the overlay). This file is
-//! only the driver: a surrogate network with latency and loss, Raft's cluster view arriving
-//! with a delay, a failure detector with a delay, a load, and the measurements. The node logic
-//! lives in the two crates; nothing here decides anything about shares.
+//! Every node runs a [`Lease`] (the protocol) and computes its place in the tree from the
+//! cluster view it holds ([`leasetree::tree::place`]). This file is only the driver: a
+//! surrogate network with latency and loss, Raft's cluster view arriving with a delay, a
+//! failure detector with a delay, a load, and the measurements. The node logic lives in the
+//! crate; nothing here decides anything about shares or about the tree.
 //!
 //! Measured, over cluster sizes, TTLs and seeds:
 //!
@@ -15,15 +16,15 @@
 //!       and the message cost,
 //!   (b) a mid-tree node down and back: the flow to its subtree,
 //!   (c) joins: the same figures,
-//!   (d) two data centres: how much of the traffic crosses between them, and whether the
-//!       lease tree follows the overlay's.
+//!   (d) two data centres: how much of the traffic crosses between them, and whether every
+//!       node's lease parent is the one the true view gives.
 //!
 //! Deterministic (seeded). Run: `cargo run -p lease-sim --release`.
 
 use std::collections::BTreeSet;
 
+use leasetree::tree::{place, Place};
 use leasetree::{Action as LAction, Config as LConfig, Lease, LeaseRequest, LeaseResponse, Limit};
-use plumtree_fsm::{Action as PAction, Config as PConfig, Message as PMessage, Plumtree};
 
 type Id = u32;
 type Key = &'static str;
@@ -51,7 +52,6 @@ impl Rng {
 // ---------------------------------------------------------------- the world
 
 enum Wire {
-    Plum(PMessage<Id>),
     Call(LeaseRequest<Id, Key>),
     Reply(LeaseResponse<Id, Key>),
 }
@@ -66,14 +66,14 @@ struct Pending {
 struct Node {
     id: Id,
     dc: u8,
-    tree: Plumtree<Id>,
     lease: Lease<Id, Key>,
     member: bool,
     up: bool,
-    /// The hop count the leader's latest message arrived at, and the peers the last two
-    /// came through.
-    depth: Option<u16>,
-    deliverers: [Option<Id>; 2],
+    /// The cluster view this node holds: the leader and term Raft told it, and the members
+    /// its failure detector has not called down.
+    seen_leader: Id,
+    seen_term: u64,
+    known_down: BTreeSet<Id>,
     offered: u64,
     admitted: u64,
 }
@@ -95,16 +95,85 @@ enum Event {
     UpMidTree,
 }
 
+/// The placement rule under test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rule {
+    /// The crate's `tree::place`: a heap over the domain's members by rank.
+    Heap,
+    /// A trie over the ids themselves: `parent(x)` clears the lowest nonzero base-`fan_in`
+    /// digit of `x`, climbing over absent ids; the domain's lowest id is its root; the
+    /// leader's domain is re-rooted at the leader, which flips only the path between them.
+    Trie,
+}
+
+/// The trie rule. A node's position depends on its id alone, so a membership change moves
+/// only the nodes next to it, and a leader change only the path from the leader to the old
+/// root of its domain.
+fn place_trie(me: Id, leader: Id, members: &[(Id, u8)], k: usize) -> Option<Place<Id>> {
+    let k = k.max(2) as u32;
+    let dom = |id: Id| members.iter().find(|(x, _)| *x == id).map(|(_, d)| *d);
+    let my_dc = dom(me)?;
+    let leader_dc = dom(leader)?;
+    let present = |id: Id| members.iter().any(|(x, d)| *x == id && *d == my_dc);
+    let min = members
+        .iter()
+        .filter(|(_, d)| *d == my_dc)
+        .map(|(x, _)| *x)
+        .min()?;
+    // Clear the lowest nonzero base-k digit; the nearest present ancestor, else the min.
+    let trie_parent = |mut x: Id| -> Option<Id> {
+        if x == min {
+            return None;
+        }
+        loop {
+            let mut p = 1u32;
+            while (x / p).is_multiple_of(k) && p <= x {
+                p *= k;
+            }
+            if p > x {
+                return Some(min);
+            }
+            x -= (x / p % k) * p;
+            if present(x) {
+                return Some(x);
+            }
+            if x == 0 {
+                return Some(min);
+            }
+        }
+    };
+    if me == leader {
+        return Some(Place::Root);
+    }
+    if my_dc != leader_dc {
+        return Some(if me == min {
+            Place::Under(leader)
+        } else {
+            Place::Under(trie_parent(me)?)
+        });
+    }
+    // The leader's domain: the path from the leader up to the trie root flips direction.
+    let mut path = vec![leader];
+    let mut at = leader;
+    while let Some(p) = trie_parent(at) {
+        path.push(p);
+        at = p;
+    }
+    if let Some(i) = path.iter().position(|x| *x == me) {
+        return Some(Place::Under(path[i - 1]));
+    }
+    Some(Place::Under(trie_parent(me)?))
+}
+
 #[derive(Clone)]
 struct Params {
     nodes: u32,
     /// Data centres; node `i` is in `i % dcs`.
     dcs: u8,
-    /// Nodes per data centre that list a peer in each other data centre.
-    gateways: usize,
-    fanout: usize,
-    /// Extra random lazy peers per node beyond the eager ones.
-    lazy: usize,
+    /// Children per node inside a data centre.
+    fan_in: usize,
+    /// How a node's place is computed.
+    rule: Rule,
     loss: f64,
     latency: u64,
     cross_latency: u64,
@@ -113,8 +182,6 @@ struct Params {
     rate: u64,
     offered: u64,
     chunk: u64,
-    /// How often the leader sends something over the overlay.
-    leader_period: u64,
     /// How long Raft's view takes to reach a node, and the failure detector its verdict.
     view_delay: u64,
     fd_delay: u64,
@@ -138,8 +205,6 @@ struct World {
     // measurements
     lease_msgs: u64,
     cross_lease_msgs: u64,
-    plum_msgs: u64,
-    cross_plum_msgs: u64,
     /// Requests admitted per tick, cluster-wide, and throttled while the rate had room.
     admitted_by_tick: Vec<u64>,
     throttled_by_tick: Vec<u64>,
@@ -151,12 +216,8 @@ struct World {
 
 impl World {
     fn new(p: Params) -> Self {
-        let mut rng = Rng(p.seed);
-        let ids: Vec<Id> = (0..p.nodes).collect();
-        let nodes = ids
-            .iter()
-            .map(|&id| Self::fresh(id, &ids, &p, &mut rng))
-            .collect();
+        let rng = Rng(p.seed);
+        let nodes = (0..p.nodes).map(|id| Self::fresh(id, &p, 0, 1)).collect();
         let mut w = World {
             nodes,
             leader: 0,
@@ -171,8 +232,6 @@ impl World {
             p,
             lease_msgs: 0,
             cross_lease_msgs: 0,
-            plum_msgs: 0,
-            cross_plum_msgs: 0,
             admitted_by_tick: Vec::new(),
             throttled_by_tick: Vec::new(),
             admitted_this_tick: 0,
@@ -180,55 +239,45 @@ impl World {
             depth_by_tick: Vec::new(),
             subtree_flow: Vec::new(),
         };
-        let members: Vec<Id> = w.nodes.iter().map(|n| n.id).collect();
-        for n in &mut w.nodes {
-            n.lease.set_cluster_view(Some(&members), 0, 1);
+        for i in 0..w.nodes.len() {
+            w.apply_view(i);
         }
         w
+    }
+
+    fn place_of(&self, id: Id, leader: Id, members: &[(Id, u8)]) -> Option<Place<Id>> {
+        match self.p.rule {
+            Rule::Heap => place(&id, &leader, members, self.p.fan_in),
+            Rule::Trie => place_trie(id, leader, members, self.p.fan_in),
+        }
+    }
+
+    /// Bring a node's lease machine in line with the view it holds: the members it believes
+    /// online, the leader and term, and its place in the tree those define.
+    fn apply_view(&mut self, i: usize) {
+        let n = &self.nodes[i];
+        let members: Vec<(Id, u8)> = self
+            .nodes
+            .iter()
+            .filter(|m| m.member && !n.known_down.contains(&m.id))
+            .map(|m| (m.id, m.dc))
+            .collect();
+        let list: Vec<Id> = members.iter().map(|(id, _)| *id).collect();
+        let (id, leader, term) = (n.id, n.seen_leader, n.seen_term);
+        let p = self.place_of(id, leader, &members);
+        let n = &mut self.nodes[i];
+        n.lease.set_cluster_view(Some(&list), leader, term);
+        if let Some(Place::Under(parent)) = p {
+            n.lease.set_parent(parent);
+        }
+        self.pump_lease(i);
     }
 
     fn dc_of(id: Id, p: &Params) -> u8 {
         (id % u32::from(p.dcs)) as u8
     }
 
-    fn fresh(id: Id, others: &[Id], p: &Params, rng: &mut Rng) -> Node {
-        let dc = Self::dc_of(id, p);
-        let mut peers: Vec<Id> = others.iter().copied().filter(|&x| x != id).collect();
-        for i in (1..peers.len()).rev() {
-            peers.swap(i, rng.below(i + 1));
-        }
-        // The overlay knows a few peers, not everyone: `fanout` plus `lazy` in the same
-        // domain, and, for a gateway, one in each other domain at the cost of the latency
-        // ratio. Plumtree picks eager and lazy among them.
-        let gateway = (id / u32::from(p.dcs)) < p.gateways as u32;
-        let cost_of = |q: Id| -> u8 {
-            if Self::dc_of(q, p) == dc {
-                0
-            } else {
-                p.cross_latency as u8
-            }
-        };
-        let mut chosen: Vec<(Id, u8)> = Vec::new();
-        let mut same = 0usize;
-        let mut entered = BTreeSet::new();
-        for &q in &peers {
-            let cost = cost_of(q);
-            let take = if cost == 0 {
-                same += 1;
-                same <= p.fanout + p.lazy
-            } else {
-                gateway && entered.insert(cost)
-            };
-            if take {
-                chosen.push((q, cost));
-            }
-        }
-        let cfg = PConfig {
-            graft_timeout: 8,
-            cache_cap: 4096,
-            fanout: p.fanout,
-            ..PConfig::default()
-        };
+    fn fresh(id: Id, p: &Params, leader: Id, term: u64) -> Node {
         let mut lease = Lease::new(id, LConfig { ttl: p.ttl });
         lease.set_limit(
             RPS,
@@ -239,13 +288,13 @@ impl World {
         );
         Node {
             id,
-            dc,
-            tree: Plumtree::new(id, chosen, cfg),
+            dc: Self::dc_of(id, p),
             lease,
             member: true,
             up: true,
-            depth: None,
-            deliverers: [None, None],
+            seen_leader: leader,
+            seen_term: term,
+            known_down: BTreeSet::new(),
             offered: 0,
             admitted: 0,
         }
@@ -255,26 +304,10 @@ impl World {
         self.nodes.iter().position(|n| n.id == id)
     }
 
-    fn members(&self) -> Vec<Id> {
-        self.nodes
-            .iter()
-            .filter(|n| n.member)
-            .map(|n| n.id)
-            .collect()
-    }
-
     fn send(&mut self, from: Id, dst: Id, msg: Wire) {
         let cross = self.nodes[self.idx(from).unwrap()].dc != self.nodes[self.idx(dst).unwrap()].dc;
-        match msg {
-            Wire::Call(_) | Wire::Reply(_) => {
-                self.lease_msgs += 1;
-                self.cross_lease_msgs += u64::from(cross);
-            }
-            Wire::Plum(_) => {
-                self.plum_msgs += 1;
-                self.cross_plum_msgs += u64::from(cross);
-            }
-        }
+        self.lease_msgs += 1;
+        self.cross_lease_msgs += u64::from(cross);
         if self.rng.unit() >= self.p.loss {
             let latency = if cross {
                 self.p.cross_latency
@@ -288,30 +321,6 @@ impl World {
                 msg,
             });
         }
-    }
-
-    /// Run a node's queued actions: plumtree's and the lease's.
-    fn pump(&mut self, i: usize, from: Option<Id>) {
-        let id = self.nodes[i].id;
-        for a in self.nodes[i].tree.ready() {
-            match a {
-                PAction::Send(peer, m) => self.send(id, peer, Wire::Plum(m)),
-                PAction::Deliver(payload) => {
-                    // The leader's traffic: its term and id. Raft's word arrives separately
-                    // and slower; the message is only a hint, and the deliverer is upstream.
-                    let term = u64::from_be_bytes(payload[0..8].try_into().unwrap());
-                    let leader = u32::from_be_bytes(payload[8..12].try_into().unwrap());
-                    let n = &mut self.nodes[i];
-                    if term > n.lease.term() {
-                        n.lease.set_cluster_view(None, leader, term);
-                    }
-                    if let Some(f) = from {
-                        n.lease.set_upstream(f);
-                    }
-                }
-            }
-        }
-        self.pump_lease(i);
     }
 
     fn pump_lease(&mut self, i: usize) {
@@ -345,13 +354,11 @@ impl World {
 
         let (due, keep): (Vec<_>, Vec<_>) = self.views.drain(..).partition(|(t, _)| *t <= self.now);
         self.views = keep;
-        let members = self.members();
         for (_, id) in due {
             if let Some(i) = self.idx(id) {
-                self.nodes[i]
-                    .lease
-                    .set_cluster_view(Some(&members), self.leader, self.term);
-                self.pump_lease(i);
+                self.nodes[i].seen_leader = self.leader;
+                self.nodes[i].seen_term = self.term;
+                self.apply_view(i);
             }
         }
         let (due, keep): (Vec<_>, Vec<_>) =
@@ -370,17 +377,6 @@ impl World {
                 continue;
             }
             match m.msg {
-                Wire::Plum(pm) => {
-                    if let PMessage::Gossip { id, round, .. } = &pm {
-                        if id.0 == self.leader {
-                            let n = &mut self.nodes[i];
-                            n.depth = Some(*round);
-                            n.deliverers = [Some(m.from), n.deliverers[0]];
-                        }
-                    }
-                    self.nodes[i].tree.on_message(m.from, pm);
-                    self.pump(i, Some(m.from));
-                }
                 Wire::Call(req) => {
                     let resp = self.nodes[i].lease.on_request(m.from, req);
                     self.send(m.dst, m.from, Wire::Reply(resp));
@@ -393,50 +389,58 @@ impl World {
             }
         }
 
-        if self.now.is_multiple_of(self.p.leader_period) {
-            if let Some(l) = self.idx(self.leader) {
-                let mut payload = self.term.to_be_bytes().to_vec();
-                payload.extend_from_slice(&self.leader.to_be_bytes());
-                self.nodes[l].tree.broadcast(payload);
-                self.nodes[l].depth = Some(0);
-                self.pump(l, None);
-            }
-        }
-
         for i in 0..self.nodes.len() {
             if !self.nodes[i].member {
                 continue;
             }
             if self.nodes[i].up {
                 self.offer_load(i);
-                self.nodes[i].tree.tick(1);
             }
             self.nodes[i].lease.tick(1);
-            self.pump(i, None);
+            self.pump_lease(i);
         }
         self.measure();
     }
 
+    /// The failure detector's verdict reaches every active node: its view changes, and so
+    /// may its place.
     fn verdict(&mut self, e: Event) {
-        match e {
-            Event::Down(id) => {
-                for n in &mut self.nodes {
-                    if n.active() && n.id != id {
-                        n.tree.down(&[id]);
-                        n.lease.down(&[id]);
-                    }
-                }
+        let (id, down) = match e {
+            Event::Down(id) => (id, true),
+            Event::Up(id) => (id, false),
+            _ => return,
+        };
+        for i in 0..self.nodes.len() {
+            if !self.nodes[i].active() || self.nodes[i].id == id {
+                continue;
             }
-            Event::Up(id) => {
-                for n in &mut self.nodes {
-                    if n.active() && n.id != id {
-                        n.tree.up(&[id]);
-                        n.lease.up(&[id]);
-                    }
-                }
+            let n = &mut self.nodes[i];
+            if down {
+                n.known_down.insert(id);
+                n.lease.down(&[id]);
+            } else {
+                n.known_down.remove(&id);
+                n.lease.up(&[id]);
             }
-            _ => {}
+            self.apply_view(i);
         }
+    }
+
+    /// Hops from `id` up to the leader along lease parents; `None` while the chain is broken,
+    /// as it is for a tick or two on a node in the middle of switching parents.
+    fn depth_of(&self, id: Id) -> Option<u16> {
+        let mut at = id;
+        let mut hops = 0u16;
+        while at != self.leader {
+            at = self
+                .idx(at)
+                .and_then(|i| self.nodes[i].lease.parent().copied())?;
+            hops += 1;
+            if usize::from(hops) > self.nodes.len() {
+                return None;
+            }
+        }
+        Some(hops)
     }
 
     fn measure(&mut self) {
@@ -448,7 +452,7 @@ impl World {
             .nodes
             .iter()
             .filter(|n| n.active())
-            .filter_map(|n| n.depth)
+            .filter_map(|n| self.depth_of(n.id))
             .max()
             .unwrap_or(0);
         self.depth_by_tick.push(depth);
@@ -502,7 +506,8 @@ impl World {
     }
 
     fn depth_recovery(&self, at: u64) -> (u16, u16, Option<u64>) {
-        let before = Self::window_slice(&self.depth_by_tick, at - 20, at)
+        // `depth_by_tick[t - 1]` is tick `t`; the event tick itself stays out of "before".
+        let before = Self::window_slice(&self.depth_by_tick, at - 21, at - 1)
             .iter()
             .copied()
             .max()
@@ -521,9 +526,15 @@ impl World {
         (before, peak, back)
     }
 
-    /// Non-leader nodes whose lease parent delivered one of the last two of the leader's
-    /// messages: the lease tree's agreement with the overlay's.
+    /// Non-leader nodes whose lease parent is the one the true view gives: how far the
+    /// cluster has converged on the tree.
     fn agreement(&self) -> (usize, usize) {
+        let members: Vec<(Id, u8)> = self
+            .nodes
+            .iter()
+            .filter(|n| n.active())
+            .map(|n| (n.id, n.dc))
+            .collect();
         let nodes: Vec<&Node> = self
             .nodes
             .iter()
@@ -532,8 +543,10 @@ impl World {
         let agree = nodes
             .iter()
             .filter(|n| {
-                let p = n.lease.parent();
-                p.is_some() && n.deliverers.iter().any(|d| d.as_ref() == p)
+                matches!(
+                    self.place_of(n.id, self.leader, &members),
+                    Some(Place::Under(p)) if n.lease.parent() == Some(&p)
+                )
             })
             .count();
         (agree, nodes.len())
@@ -633,21 +646,8 @@ impl World {
                 }
                 Event::Join => {
                     let new_id = self.nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
-                    let peers = self.members();
-                    let p = self.p.clone();
-                    let node = Self::fresh(new_id, &peers, &p, &mut self.rng);
+                    let node = Self::fresh(new_id, &self.p, self.leader, self.term);
                     self.nodes.push(node);
-                    let new_dc = Self::dc_of(new_id, &self.p);
-                    for n in &mut self.nodes {
-                        if n.active() && n.id != new_id {
-                            let cost = if n.dc == new_dc {
-                                0
-                            } else {
-                                p.cross_latency as u8
-                            };
-                            n.tree.membership(&[(new_id, cost)], &[]);
-                        }
-                    }
                     self.schedule_views();
                 }
             }
@@ -663,6 +663,10 @@ impl World {
         }
         let due = self.now + self.p.fd_delay;
         self.verdicts.push((due, e));
+        if matches!(e, Event::Up(_)) {
+            // Back up with a stale view: Raft's word reaches it like any other node's.
+            self.views.push((self.now + self.p.view_delay, id));
+        }
         if self.leader == id && !self.nodes[i].active() {
             let next = self
                 .nodes
@@ -693,13 +697,11 @@ impl World {
 const EVENT_AT: u64 = 300;
 
 fn base(nodes: u32, ttl: u64) -> Params {
-    let fanout = (f64::from(nodes).log2().ceil() as usize + 1).max(3);
     Params {
         nodes,
         dcs: 1,
-        gateways: 2,
-        fanout,
-        lazy: 6,
+        fan_in: 4,
+        rule: Rule::Heap,
         loss: 0.05,
         latency: 1,
         cross_latency: 10,
@@ -709,7 +711,6 @@ fn base(nodes: u32, ttl: u64) -> Params {
         rate: 3 * u64::from(nodes) / 2,
         offered: 2,
         chunk: 2,
-        leader_period: 5,
         view_delay: 3,
         fd_delay: 5,
         rounds: 600,
@@ -840,15 +841,14 @@ struct Cell {
     depth_back: Option<f64>,
     msgs: f64,
     cross_lease: f64,
-    cross_plum: f64,
     cross_edges: f64,
     agreement: f64,
 }
 
-fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
+fn event_cell(mk: &dyn Fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
     let (mut over, mut util, mut ft, mut d_before, mut d_peak, mut d_back, mut msgs) =
         (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-    let (mut xl, mut xp, mut xe, mut ag) = (vec![], vec![], vec![], vec![]);
+    let (mut xl, mut xe, mut ag) = (vec![], vec![], vec![]);
     for &seed in &SEEDS {
         let mut w = World::new(Params { seed, ..mk(n, ttl) });
         w.run_to_end();
@@ -871,7 +871,6 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
         d_back.push(back);
         msgs.push(w.msgs_per_node_tick());
         xl.push(w.cross_lease_msgs as f64 / w.lease_msgs.max(1) as f64 * 100.0);
-        xp.push(w.cross_plum_msgs as f64 / w.plum_msgs.max(1) as f64 * 100.0);
         xe.push(w.cross_edges() as f64);
         let (agree, all) = w.agreement();
         ag.push(agree as f64 / all.max(1) as f64 * 100.0);
@@ -885,7 +884,6 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
         depth_back: mean_opt(&d_back),
         msgs: mean(&msgs),
         cross_lease: mean(&xl),
-        cross_plum: mean(&xp),
         cross_edges: fmax(&xe),
         agreement: mean(&ag),
     }
@@ -893,8 +891,8 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
 
 fn main() {
     println!(
-        "tree-leased rate limits: leasetree over plumtree-fsm, 5% loss, fanout log2 N + 1, demand \
-         at 4/3 of the rate, {} seeds per row: bounds are the worst seed, costs the mean",
+        "tree-leased rate limits: leasetree over a tree computed from the view, fan-in 4, 5% loss, \
+         demand at 4/3 of the rate, {} seeds per row: bounds are the worst seed, costs the mean",
         SEEDS.len()
     );
     println!("+throttled is the event window's count beyond a no-event control's\n");
@@ -906,29 +904,32 @@ fn main() {
         ),
         ("(c) five joins from tick 300", joins),
     ] {
-        println!("{title}");
-        println!(
-            "  {:>4} {:>4} {:>10} {:>8} {:>11} {:>14} {:>11}",
-            "N", "TTL", "overshoot", "used", "+throttled", "depth b/p/back", "msgs/node/t"
-        );
-        for &n in &[10u32, 50, 200] {
-            for &ttl in &[10u64, 40] {
-                let c = event_cell(mk, n, ttl);
-                println!(
-                    "  {:>4} {:>4} {:>9.1}% {:>7.0}% {:>11.0} {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
-                    n,
-                    ttl,
-                    c.overshoot,
-                    c.utilization,
-                    c.false_throttles,
-                    c.depth_before,
-                    c.depth_peak,
-                    opt(c.depth_back),
-                    c.msgs
-                );
+        for rule in [Rule::Heap, Rule::Trie] {
+            let mk = move |n, ttl| Params { rule, ..mk(n, ttl) };
+            println!("{title}, {rule:?}");
+            println!(
+                "  {:>4} {:>4} {:>10} {:>8} {:>11} {:>14} {:>11}",
+                "N", "TTL", "overshoot", "used", "+throttled", "depth b/p/back", "msgs/node/t"
+            );
+            for &n in &[10u32, 50, 200] {
+                for &ttl in &[10u64, 40] {
+                    let c = event_cell(&mk, n, ttl);
+                    println!(
+                        "  {:>4} {:>4} {:>9.1}% {:>7.0}% {:>11.0} {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
+                        n,
+                        ttl,
+                        c.overshoot,
+                        c.utilization,
+                        c.false_throttles,
+                        c.depth_before,
+                        c.depth_peak,
+                        opt(c.depth_back),
+                        c.msgs
+                    );
+                }
             }
+            println!();
         }
-        println!();
     }
 
     println!("(b) a mid-tree node down at {EVENT_AT}, back 4 TTLs later: its subtree's flow");
@@ -984,26 +985,32 @@ fn main() {
         "\n(d) two data centres (latency 1 inside, 10 across), with a leader change at {EVENT_AT}"
     );
     println!(
-        "  {:>4} {:>4} {:>10} {:>12} {:>12} {:>11} {:>7} {:>14} {:>11}",
+        "  {:>4} {:>4} {:>10} {:>12} {:>11} {:>8} {:>14} {:>11}",
         "N",
         "TTL",
         "overshoot",
         "cross lease",
-        "cross plum",
         "cross edges",
-        "follows",
+        "in place",
         "depth b/p/back",
         "msgs/node/t"
     );
-    for &n in &[50u32, 200] {
-        let c = event_cell(two_dcs, n, 40);
-        println!(
-            "  {:>4} {:>4} {:>9.1}% {:>11.1}% {:>11.1}% {:>11.0} {:>6.0}% {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
+    for rule in [Rule::Heap, Rule::Trie] {
+        for &n in &[50u32, 200] {
+            let c = event_cell(
+                &move |n, ttl| Params {
+                    rule,
+                    ..two_dcs(n, ttl)
+                },
+                n,
+                40,
+            );
+            println!(
+            "  {:>4} {:>4} {:>9.1}% {:>11.1}% {:>11.0} {:>7.0}% {:>7.0}/{:>2.0}/{:>3} {:>11.2}  {rule:?}",
             n,
             40,
             c.overshoot,
             c.cross_lease,
-            c.cross_plum,
             c.cross_edges,
             c.agreement,
             c.depth_before,
@@ -1011,15 +1018,16 @@ fn main() {
             opt(c.depth_back),
             c.msgs
         );
+        }
     }
     println!(
         "\n  overshoot   = admitted over the rate across the window, as a share of the rate, worst seed\n  \
          used        = admitted in the window, as a share of what the rate allowed\n  \
          +throttled  = requests refused in ticks where the rate had room, beyond a control run\n  \
          depth       = tree depth before the change / peak after / ticks until back within one hop\n  \
-         cross lease = share of lease messages that crossed between data centres (cross plum: the overlay's)\n  \
+         cross lease = share of lease messages that crossed between data centres\n  \
          cross edges = tree edges between the data centres at the end, worst seed\n  \
-         follows     = nodes whose lease parent delivered one of the last two of the leader's messages\n  \
+         in place    = nodes whose lease parent is the one the true view gives, at the end\n  \
          trees       = seeds whose tree had a mid-tree node to take down\n  \
          dip after   = ticks from the outage until the subtree's flow fell below 95% of baseline\n  \
          dip len     = ticks it then stayed down (and in how many seeds it dipped at all)"
@@ -1104,12 +1112,14 @@ mod tests {
     }
 
     #[test]
-    fn the_lease_tree_settles_on_the_overlay_s_tree() {
+    fn every_node_ends_in_the_place_the_view_gives_it() {
+        // Deterministic: once the views agree, so do the trees, loss or no loss.
         for (mk, loss) in [
             (leader_change as fn(u32, u64) -> Params, 0.0),
             (leader_change, 0.05),
-            (two_dcs, 0.0),
             (two_dcs, 0.05),
+            (mid_tree_outage, 0.05),
+            (joins, 0.05),
         ] {
             let mut w = World::new(Params {
                 loss,
@@ -1117,11 +1127,7 @@ mod tests {
             });
             w.run_to_end();
             let (agree, all) = w.agreement();
-            let floor = if loss == 0.0 { 100 } else { 80 };
-            assert!(
-                agree * 100 >= all * floor,
-                "loss {loss}: {agree} of {all} nodes have an overlay deliverer as lease parent"
-            );
+            assert_eq!(agree, all, "loss {loss}: nodes in the place the view gives");
         }
     }
 
@@ -1130,9 +1136,9 @@ mod tests {
         let mut w = World::new(two_dcs(50, 40));
         w.run_to_end();
         let edges = w.cross_edges();
-        assert!(
-            edges <= 4,
-            "{edges} tree edges cross between the data centres"
+        assert_eq!(
+            edges, 1,
+            "{edges} tree edges cross between the data centres: one gateway"
         );
     }
 }
