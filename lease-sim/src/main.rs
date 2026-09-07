@@ -207,6 +207,7 @@ impl World {
             Limit {
                 limit: p.rate,
                 chunk: p.chunk,
+                burst: 0,
             },
         );
         Node {
