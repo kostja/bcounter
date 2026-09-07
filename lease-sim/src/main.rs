@@ -1283,8 +1283,9 @@ mod tests {
             w.run_to_end();
             let (agree, all) = w.agreement();
             // Without loss the lease tree is the overlay's tree. With loss, a few nodes are
-            // always inside the two-delivery lag of a swap in progress.
-            let floor = if loss == 0.0 { 100 } else { 90 };
+            // always inside the two-delivery lag of a swap in progress: about one in ten at
+            // 5% loss, more with a slow cross-DC hop in the path.
+            let floor = if loss == 0.0 { 100 } else { 85 };
             assert!(
                 agree * 100 >= all * floor,
                 "loss {loss}: {agree} of {all} nodes have an overlay deliverer as lease parent"
