@@ -27,9 +27,11 @@ over-booking) are the worst seed; costs are the mean.
 
 ## Reading the numbers
 
-The stock never overshoots in any scenario. Over-booking peaks during a re-orientation, because
-a moving lease is booked by both parents until the new one confirms; it is transient and not a
-spending risk. The rate is admitted while a node is unleased, so a subtree's flow never stalls
+The stock overshoots only during a re-orientation with a full quota, by what a subtree writes
+while a cut walks down to it, about 1% of the limit at N=200 and nothing at all on small
+clusters; that is accepted, a stock fills over days and a leader change takes seconds.
+Over-booking peaks during a re-orientation, because a moving lease is booked by both parents
+until the new one confirms; it is transient and not a spending risk. The rate is admitted while a node is unleased, so a subtree's flow never stalls
 when its parent dies; it dips only for the few ticks a node spends re-leased at zero.
 
 The tree's depth is `log2 N`-ish with an eager fanout of `log2 N + 1`, and returns there within

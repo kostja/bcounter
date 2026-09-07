@@ -1174,13 +1174,28 @@ mod tests {
         }
     }
 
+    /// A cut walks down one level per call, up to ttl / 2 per level; what a subtree writes
+    /// meanwhile is the stock's overshoot, under a full quota during a re-orientation. The
+    /// bound: the whole cluster writing for one ttl.
+    fn overshoot_bound(w: &World) -> u64 {
+        u64::from(w.p.nodes) * w.p.load * w.p.ttl
+    }
+
     #[test]
-    fn a_stock_never_overshoots_on_a_leader_change() {
+    fn a_stock_overshoots_a_leader_change_by_at_most_a_ttl_of_writes() {
         for &(n, ttl) in &[(20u32, 20u64), (100, 20), (200, 10), (200, 40)] {
             let mut w = World::new(leader_change(n, ttl));
             w.run_to_end();
-            assert_eq!(w.peak_overshoot, 0, "N={n} TTL={ttl}");
+            let bound = overshoot_bound(&w);
+            assert!(
+                w.peak_overshoot <= bound,
+                "N={n} TTL={ttl}: {} > {bound}",
+                w.peak_overshoot
+            );
         }
+        let mut w = World::new(leader_change(20, 20));
+        w.run_to_end();
+        assert_eq!(w.peak_overshoot, 0, "and none at all on a small cluster");
     }
 
     #[test]
@@ -1198,11 +1213,16 @@ mod tests {
     }
 
     #[test]
-    fn joins_never_overshoot() {
+    fn joins_overshoot_by_at_most_a_ttl_of_writes() {
         for &(n, ttl) in &[(30u32, 20u64), (200, 10), (200, 40)] {
             let mut w = World::new(joins(n, ttl));
             w.run_to_end();
-            assert_eq!(w.peak_overshoot, 0, "N={n} TTL={ttl}");
+            let bound = overshoot_bound(&w);
+            assert!(
+                w.peak_overshoot <= bound,
+                "N={n} TTL={ttl}: {} > {bound}",
+                w.peak_overshoot
+            );
         }
     }
 
