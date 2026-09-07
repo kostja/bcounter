@@ -1,11 +1,11 @@
 # lease-sim
 
-The tree-leased quota, driven the way a server drives it. Every node runs a
+The tree-leased rate limit, driven the way a server drives it. Every node runs a
 [`leasetree`](https://github.com/kostja/leasetree) `Lease` (the protocol) and a
 [`plumtree-fsm`](https://github.com/kostja/plumtree) `Plumtree` (the overlay). This crate is only
 the driver: a surrogate network with latency and loss, Raft's cluster view arriving with a delay,
 a failure detector with a delay, a load, and the measurements. Nothing here decides anything
-about leases; that is what makes it a preview of embedding the quotas in a server.
+about shares; that is what makes it a preview of embedding the rate limits in a server.
 
 ```
 cargo run -p lease-sim --release   # the four tables
@@ -14,34 +14,33 @@ cargo test -p lease-sim --release  # the invariants
 
 ## What it measures
 
-Over cluster sizes 10/50/200, TTLs 10/40 and five seeds. Bounds (overshoot,
-over-booking) are the worst seed; costs are the mean.
+Every node offers two requests per tick against a cluster-wide rate of one and a half per node,
+so the limit binds and shares must move to where the load is. Over cluster sizes 10/50/200,
+TTLs 10/40 and five seeds; bounds are the worst seed, costs the mean.
 
-- **(a) a leader change**: overshoot, peak over-booking, false denials beyond a no-event
-  control, how long the new leader's total takes to catch up, how deep the tree got and how
-  fast it rebalanced, and lease messages per node per tick.
-- **(b) a mid-tree node down and back**: when its subtree's rate flow drops, how far, how long.
-- **(c) five joins**: the over-commit from lease adoption.
+- **(a) a leader change** and **(c) five joins**: how far the cluster admitted over the rate
+  across the event window, how much of the rate it used, requests throttled while the rate
+  had room beyond a no-event control, how deep the tree got and how fast it rebalanced, and
+  lease messages per node per tick.
+- **(b) a mid-tree node down and back**: when its subtree's flow drops, how far, how long.
 - **(d) two data centres** at latency 1 inside and 10 across, with a leader change: the share
   of lease and overlay traffic that crosses, the number of tree edges that do, and how many
-  nodes' lease parent is the peer the overlay delivers through. The lease tree has no shape
-  of its own: at zero loss it is the overlay's tree exactly, and under loss a few nodes are
-  always inside the two-delivery lag of a swap in progress.
+  nodes' lease parent is the peer the overlay delivers through.
 
 ## Reading the numbers
 
-The stock overshoots only during a re-orientation with a full quota, by what a subtree writes
-while a cut walks down to it, about 1% of the limit at N=200 and nothing at all on small
-clusters; that is accepted, a stock fills over days and a leader change takes seconds.
-Over-booking peaks during a re-orientation, because a moving lease is booked by both parents
-until the new one confirms; it is transient and not a spending risk. The rate is admitted while a node is unleased, so a subtree's flow never stalls
-when its parent dies; it dips only for the few ticks a node spends re-leased at zero.
+A rate is an average, and a token bucket bursts for a tick, so overshoot is measured across
+the window. In steady state the cluster admits at or under the rate. Around a leader change
+or a join it admits over it, by what unleased nodes admit while they wait for a share: a
+round trip or two, the trade a rate limit makes for availability.
 
-The tree's depth is `log2 N`-ish with an eager fanout of `log2 N + 1`, and returns there within
-a few of the leader's messages after a change. Only `gateways` nodes per data centre list a
-peer in another; that bounds the cross-DC tree edges by construction (2 per DC here), and the
-cost rules choose well among what remains: 3% of lease traffic and 0.2% of overlay traffic
-cross at N=200.
+Under contention a few nodes hold no share at all: shares are handed out first come, and
+nothing rebalances them among busy nodes. That is a fairness question, open.
+
+The lease tree has no shape of its own: at zero loss it is the overlay's tree exactly, and
+under loss most nodes are on it, the rest inside the two-delivery lag of a link swap in
+progress. Only `gateways` nodes per data centre list a peer in another; that bounds the
+cross-DC tree edges by construction.
 
 The driver in `src/main.rs` is the reference for the caller's side: what to feed the two state
 machines, from where, and when.

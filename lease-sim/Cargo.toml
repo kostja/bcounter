@@ -6,6 +6,5 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bcounter = { path = ".." }
 leasetree = { git = "https://github.com/kostja/leasetree" }
 plumtree-fsm = { git = "https://github.com/kostja/plumtree" }

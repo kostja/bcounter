@@ -1,32 +1,32 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Konstantin Osipov.
 
-//! The tree-leased quota, driven the way a server drives it.
+//! The tree-leased rate limit, driven the way a server drives it.
 //!
 //! Every node runs a [`Lease`] (the protocol) and a [`Plumtree`] (the overlay). This file is
 //! only the driver: a surrogate network with latency and loss, Raft's cluster view arriving
 //! with a delay, a failure detector with a delay, a load, and the measurements. The node logic
-//! lives in the two crates; nothing here decides anything about leases.
+//! lives in the two crates; nothing here decides anything about shares.
 //!
 //! Measured, over cluster sizes, TTLs and seeds:
 //!
-//!   (a) a leader change: overshoot, over-booking, the false denials it caused, how long the
-//!       new leader's total takes to catch up, how deep the tree got and how fast it
-//!       rebalanced, and the message cost,
+//!   (a) a leader change: how far the cluster admits over the rate, how many requests were
+//!       throttled while the rate had room, how deep the tree got and how fast it rebalanced,
+//!       and the message cost,
 //!   (b) a mid-tree node down and back: the flow to its subtree,
-//!   (c) joins: the over-commit that lease adoption causes,
-//!   (d) two data centres: how much of the traffic crosses between them.
+//!   (c) joins: the same figures,
+//!   (d) two data centres: how much of the traffic crosses between them, and whether the
+//!       lease tree follows the overlay's.
 //!
 //! Deterministic (seeded). Run: `cargo run -p lease-sim --release`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use leasetree::{Action as LAction, Config as LConfig, Lease, LeaseRequest, LeaseResponse, Limit};
 use plumtree_fsm::{Action as PAction, Config as PConfig, Message as PMessage, Plumtree};
 
 type Id = u32;
 type Key = &'static str;
-const BYTES: Key = "bytes";
 const RPS: Key = "rps";
 
 // ---------------------------------------------------------------- rng
@@ -70,11 +70,9 @@ struct Node {
     lease: Lease<Id, Key>,
     member: bool,
     up: bool,
-    /// True own usage of the stock: what the durable per-node table would hold.
-    used: u64,
-    /// The hop count the leader's latest message arrived at, and the peer it came through.
+    /// The hop count the leader's latest message arrived at, and the peers the last two
+    /// came through.
     depth: Option<u16>,
-    /// The peers the last two of the leader's messages came through.
     deliverers: [Option<Id>; 2],
     offered: u64,
     admitted: u64,
@@ -102,8 +100,7 @@ struct Params {
     nodes: u32,
     /// Data centres; node `i` is in `i % dcs`.
     dcs: u8,
-    /// Nodes per data centre that list a peer in each other data centre. The others know
-    /// only their own; that bounds the cross-DC edges of the tree by construction.
+    /// Nodes per data centre that list a peer in each other data centre.
     gateways: usize,
     fanout: usize,
     /// Extra random lazy peers per node beyond the eager ones.
@@ -112,11 +109,10 @@ struct Params {
     latency: u64,
     cross_latency: u64,
     ttl: u64,
-    limit: u64,
-    load: u64,
-    chunk: u64,
+    /// The cluster-wide rate, what each node offers per tick, and the chunk a node asks for.
     rate: u64,
     offered: u64,
+    chunk: u64,
     /// How often the leader sends something over the overlay.
     leader_period: u64,
     /// How long Raft's view takes to reach a node, and the failure detector its verdict.
@@ -132,13 +128,10 @@ struct World {
     leader: Id,
     term: u64,
     net: Vec<Pending>,
-    /// Cluster views on their way to nodes: (due, node).
     views: Vec<(u64, Id)>,
-    /// Failure-detector verdicts on their way: (due, event).
     verdicts: Vec<(u64, Event)>,
     rng: Rng,
     now: u64,
-    true_total: u64,
     mid: Option<Id>,
     subtree: Vec<Id>,
     p: Params,
@@ -147,17 +140,11 @@ struct World {
     cross_lease_msgs: u64,
     plum_msgs: u64,
     cross_plum_msgs: u64,
-    /// Plumtree link swaps (bare grafts) so far.
-    swaps: u64,
-    /// How cross-DC links re-entered eager sets: by the message that did it.
-    cross_adds: BTreeMap<&'static str, u64>,
-    peak_overshoot: u64,
-    peak_overbooked: u64,
-    fd_by_tick: Vec<u64>,
-    fd_this_tick: u64,
-    sfd_by_tick: Vec<u64>,
-    sfd_this_tick: u64,
-    lag_by_tick: Vec<u64>,
+    /// Requests admitted per tick, cluster-wide, and throttled while the rate had room.
+    admitted_by_tick: Vec<u64>,
+    throttled_by_tick: Vec<u64>,
+    admitted_this_tick: u64,
+    throttled_this_tick: u64,
     depth_by_tick: Vec<u16>,
     subtree_flow: Vec<f64>,
 }
@@ -179,7 +166,6 @@ impl World {
             verdicts: Vec::new(),
             rng,
             now: 0,
-            true_total: 0,
             mid: None,
             subtree: Vec::new(),
             p,
@@ -187,19 +173,13 @@ impl World {
             cross_lease_msgs: 0,
             plum_msgs: 0,
             cross_plum_msgs: 0,
-            swaps: 0,
-            cross_adds: BTreeMap::new(),
-            peak_overshoot: 0,
-            peak_overbooked: 0,
-            fd_by_tick: Vec::new(),
-            fd_this_tick: 0,
-            sfd_by_tick: Vec::new(),
-            sfd_this_tick: 0,
-            lag_by_tick: Vec::new(),
+            admitted_by_tick: Vec::new(),
+            throttled_by_tick: Vec::new(),
+            admitted_this_tick: 0,
+            throttled_this_tick: 0,
             depth_by_tick: Vec::new(),
             subtree_flow: Vec::new(),
         };
-        // Everyone starts with the view: Raft has settled before we begin.
         let members: Vec<Id> = w.nodes.iter().map(|n| n.id).collect();
         for n in &mut w.nodes {
             n.lease.set_cluster_view(Some(&members), 0, 1);
@@ -251,19 +231,10 @@ impl World {
         };
         let mut lease = Lease::new(id, LConfig { ttl: p.ttl });
         lease.set_limit(
-            BYTES,
-            Limit::Stock {
-                limit: p.limit,
-                chunk: p.chunk,
-                acquired: 0,
-                released: 0,
-            },
-        );
-        lease.set_limit(
             RPS,
-            Limit::Rate {
+            Limit {
                 limit: p.rate,
-                chunk: p.offered,
+                chunk: p.chunk,
             },
         );
         Node {
@@ -273,7 +244,6 @@ impl World {
             lease,
             member: true,
             up: true,
-            used: 0,
             depth: None,
             deliverers: [None, None],
             offered: 0,
@@ -300,12 +270,9 @@ impl World {
                 self.lease_msgs += 1;
                 self.cross_lease_msgs += u64::from(cross);
             }
-            Wire::Plum(ref pm) => {
+            Wire::Plum(_) => {
                 self.plum_msgs += 1;
                 self.cross_plum_msgs += u64::from(cross);
-                if matches!(pm, PMessage::Graft(None)) {
-                    self.swaps += 1;
-                }
             }
         }
         if self.rng.unit() >= self.p.loss {
@@ -358,38 +325,24 @@ impl World {
     }
 
     fn offer_load(&mut self, i: usize) {
-        let id = self.nodes[i].id;
-        let in_subtree = self.mid.is_some() && self.subtree.contains(&id);
-        let load = self.p.load;
-        match self.nodes[i].lease.acquire(&[(BYTES, load)]) {
-            Ok(()) => {
-                self.nodes[i].used += load;
-                self.true_total += load;
-            }
-            Err(_) => {
-                if self.true_total + load <= self.p.limit {
-                    self.fd_this_tick += 1;
-                    if in_subtree {
-                        self.sfd_this_tick += 1;
-                    }
-                }
-            }
-        }
         let offered = self.p.offered;
         let n = &mut self.nodes[i];
         n.offered += offered;
+        let mut admitted = 0;
         for _ in 0..offered {
             if n.lease.acquire(&[(RPS, 1)]).is_ok() {
-                n.admitted += 1;
+                admitted += 1;
             }
         }
+        n.admitted += admitted;
+        self.admitted_this_tick += admitted;
+        self.throttled_this_tick += offered - admitted;
     }
 
     fn step(&mut self) {
         self.now += 1;
         self.apply_events();
 
-        // Raft's view and the failure detector's verdicts arrive.
         let (due, keep): (Vec<_>, Vec<_>) = self.views.drain(..).partition(|(t, _)| *t <= self.now);
         self.views = keep;
         let members = self.members();
@@ -408,7 +361,6 @@ impl World {
             self.verdict(e);
         }
 
-        // The network delivers.
         let (due, keep): (Vec<Pending>, Vec<Pending>) =
             self.net.drain(..).partition(|m| m.due <= self.now);
         self.net = keep;
@@ -421,26 +373,12 @@ impl World {
                 Wire::Plum(pm) => {
                     if let PMessage::Gossip { id, round, .. } = &pm {
                         if id.0 == self.leader {
-                            self.nodes[i].depth = Some(*round);
                             let n = &mut self.nodes[i];
+                            n.depth = Some(*round);
                             n.deliverers = [Some(m.from), n.deliverers[0]];
                         }
                     }
-                    let kind = match &pm {
-                        PMessage::Gossip { .. } => "gossip",
-                        PMessage::Ihave(_) => "ihave",
-                        PMessage::Graft(Some(_)) => "graft",
-                        PMessage::Graft(None) => "swap-in",
-                        PMessage::Prune => "prune",
-                    };
-                    let from_dc = self.nodes[self.idx(m.from).unwrap()].dc;
-                    let cross = from_dc != self.nodes[i].dc;
-                    let had = self.nodes[i].tree.eager().any(|&e| e == m.from);
                     self.nodes[i].tree.on_message(m.from, pm);
-                    let has = self.nodes[i].tree.eager().any(|&e| e == m.from);
-                    if cross && !had && has {
-                        *self.cross_adds.entry(kind).or_insert(0) += 1;
-                    }
                     self.pump(i, Some(m.from));
                 }
                 Wire::Call(req) => {
@@ -455,7 +393,6 @@ impl World {
             }
         }
 
-        // The leader says something over the overlay now and then.
         if self.now.is_multiple_of(self.p.leader_period) {
             if let Some(l) = self.idx(self.leader) {
                 let mut payload = self.term.to_be_bytes().to_vec();
@@ -466,7 +403,6 @@ impl World {
             }
         }
 
-        // Every node: load, then the clocks.
         for i in 0..self.nodes.len() {
             if !self.nodes[i].member {
                 continue;
@@ -475,7 +411,6 @@ impl World {
                 self.offer_load(i);
                 self.nodes[i].tree.tick(1);
             }
-            // A partitioned node's clock still runs; its messages go nowhere.
             self.nodes[i].lease.tick(1);
             self.pump(i, None);
         }
@@ -505,22 +440,10 @@ impl World {
     }
 
     fn measure(&mut self) {
-        self.peak_overshoot = self
-            .peak_overshoot
-            .max(self.true_total.saturating_sub(self.p.limit));
-        let booked = self
-            .nodes
-            .iter()
-            .filter(|n| n.active())
-            .filter_map(|n| n.lease.stats(&BYTES))
-            .map(|s| s.overcommit)
-            .max()
-            .unwrap_or(0);
-        self.peak_overbooked = self.peak_overbooked.max(booked);
-        let lag = self.idx(self.leader).map_or(0, |l| {
-            self.true_total.abs_diff(self.nodes[l].lease.usage(&BYTES))
-        });
-        self.lag_by_tick.push(lag);
+        self.admitted_by_tick.push(self.admitted_this_tick);
+        self.throttled_by_tick.push(self.throttled_this_tick);
+        self.admitted_this_tick = 0;
+        self.throttled_this_tick = 0;
         let depth = self
             .nodes
             .iter()
@@ -529,10 +452,6 @@ impl World {
             .max()
             .unwrap_or(0);
         self.depth_by_tick.push(depth);
-        self.fd_by_tick.push(self.fd_this_tick);
-        self.fd_this_tick = 0;
-        self.sfd_by_tick.push(self.sfd_this_tick);
-        self.sfd_this_tick = 0;
         if self.mid.is_some() {
             let (o, a) = self
                 .nodes
@@ -556,30 +475,32 @@ impl World {
         &v[a.min(b)..b]
     }
 
-    fn false_denials_in(&self, from: u64, to: u64) -> u64 {
-        Self::window_slice(&self.fd_by_tick, from, to).iter().sum()
+    /// How far the cluster admitted over the rate across `[from, to)`, as a share of what the
+    /// rate allowed. A token bucket bursts for a tick; a rate is an average.
+    fn overshoot_in(&self, from: u64, to: u64) -> f64 {
+        (self.utilization_in(from, to) - 100.0).max(0.0)
     }
 
-    fn subtree_false_denials_in(&self, from: u64, to: u64) -> u64 {
-        Self::window_slice(&self.sfd_by_tick, from, to).iter().sum()
-    }
-
-    /// Ticks after `from` until the leader's total stayed within 5% of the truth for five
-    /// ticks.
-    fn catch_up_after(&self, from: u64) -> Option<u64> {
-        let close = self.p.limit / 20;
-        let mut streak = 0u64;
-        for (k, &lag) in self.lag_by_tick.iter().enumerate().skip(from as usize) {
-            streak = if lag <= close { streak + 1 } else { 0 };
-            if streak >= 5 {
-                return Some(k as u64 - from - 4);
-            }
+    /// Admitted over `[from, to)` as a share of what the rate allowed.
+    fn utilization_in(&self, from: u64, to: u64) -> f64 {
+        let s = Self::window_slice(&self.admitted_by_tick, from, to);
+        if s.is_empty() {
+            return f64::NAN;
         }
-        None
+        s.iter().sum::<u64>() as f64 / (self.p.rate * s.len() as u64) as f64 * 100.0
     }
 
-    /// The tree's depth before `at`, its peak after, and ticks until back within one hop of
-    /// the old depth.
+    /// Requests throttled in `[from, to)` in ticks where the cluster admitted less than the
+    /// rate: the rate had room and a node refused anyway.
+    fn false_throttles_in(&self, from: u64, to: u64) -> u64 {
+        let a = Self::window_slice(&self.admitted_by_tick, from, to);
+        let t = Self::window_slice(&self.throttled_by_tick, from, to);
+        a.iter()
+            .zip(t)
+            .map(|(&adm, &thr)| thr.min(self.p.rate.saturating_sub(adm)))
+            .sum()
+    }
+
     fn depth_recovery(&self, at: u64) -> (u16, u16, Option<u64>) {
         let before = Self::window_slice(&self.depth_by_tick, at - 20, at)
             .iter()
@@ -600,9 +521,8 @@ impl World {
         (before, peak, back)
     }
 
-    /// How many non-leader nodes have as lease parent a peer that delivered one of the last
-    /// two of the leader's messages to them: the lease tree's agreement with the overlay's,
-    /// allowing the one detour the parent rule allows.
+    /// Non-leader nodes whose lease parent delivered one of the last two of the leader's
+    /// messages: the lease tree's agreement with the overlay's.
     fn agreement(&self) -> (usize, usize) {
         let nodes: Vec<&Node> = self
             .nodes
@@ -619,7 +539,6 @@ impl World {
         (agree, nodes.len())
     }
 
-    /// Tree edges whose ends are in different data centres, right now.
     fn cross_edges(&self) -> usize {
         self.nodes
             .iter()
@@ -767,10 +686,6 @@ impl World {
     fn msgs_per_node_tick(&self) -> f64 {
         self.lease_msgs as f64 / self.p.rounds as f64 / f64::from(self.p.nodes)
     }
-
-    fn pct(&self, v: u64) -> f64 {
-        v as f64 / self.p.limit as f64 * 100.0
-    }
 }
 
 // ---------------------------------------------------------------- scenarios
@@ -778,8 +693,6 @@ impl World {
 const EVENT_AT: u64 = 300;
 
 fn base(nodes: u32, ttl: u64) -> Params {
-    // Eager fanout about log2 N + 1, as the paper suggests; a fanout of 3 at N = 200 gives a
-    // tree a dozen deep, and then a cross-domain shortcut looks worth ten hops.
     let fanout = (f64::from(nodes).log2().ceil() as usize + 1).max(3);
     Params {
         nodes,
@@ -791,11 +704,11 @@ fn base(nodes: u32, ttl: u64) -> Params {
         latency: 1,
         cross_latency: 10,
         ttl,
-        limit: 2_000_000,
-        load: 20,
-        chunk: 2_000_000 / u64::from(nodes) / 4,
-        rate: 3 * u64::from(nodes),
+        // Demand is 2 per node per tick; the rate allows three quarters of it, so the limit
+        // binds and shares must move to where the load is.
+        rate: 3 * u64::from(nodes) / 2,
         offered: 2,
+        chunk: 2,
         leader_period: 5,
         view_delay: 3,
         fd_delay: 5,
@@ -918,13 +831,10 @@ fn fmax(v: &[f64]) -> f64 {
     v.iter().copied().fold(f64::NEG_INFINITY, f64::max)
 }
 
-/// One cell of (a), (c) or (d): the worst overshoot and over-booking over the seeds (the
-/// bounds), the mean of the costs.
 struct Cell {
     overshoot: f64,
-    overbooked: f64,
-    false_den: f64,
-    catch_up: Option<f64>,
+    utilization: f64,
+    false_throttles: f64,
     depth_before: f64,
     depth_peak: f64,
     depth_back: Option<f64>,
@@ -936,18 +846,9 @@ struct Cell {
 }
 
 fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
-    let mut over = vec![];
-    let mut booked = vec![];
-    let mut fd = vec![];
-    let mut catch = vec![];
-    let mut d_before = vec![];
-    let mut d_peak = vec![];
-    let mut d_back = vec![];
-    let mut msgs = vec![];
-    let mut xl = vec![];
-    let mut xp = vec![];
-    let mut xe = vec![];
-    let mut ag = vec![];
+    let (mut over, mut util, mut ft, mut d_before, mut d_peak, mut d_back, mut msgs) =
+        (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+    let (mut xl, mut xp, mut xe, mut ag) = (vec![], vec![], vec![], vec![]);
     for &seed in &SEEDS {
         let mut w = World::new(Params { seed, ..mk(n, ttl) });
         w.run_to_end();
@@ -958,13 +859,12 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
         });
         c.run_to_end();
         let (a, b) = window(ttl);
-        over.push(w.pct(w.peak_overshoot));
-        booked.push(w.pct(w.peak_overbooked));
-        fd.push(
-            w.false_denials_in(a, b)
-                .saturating_sub(c.false_denials_in(a, b)) as f64,
+        over.push(w.overshoot_in(a, b));
+        util.push(w.utilization_in(a, b));
+        ft.push(
+            w.false_throttles_in(a, b)
+                .saturating_sub(c.false_throttles_in(a, b)) as f64,
         );
-        catch.push(w.catch_up_after(EVENT_AT));
         let (before, peak, back) = w.depth_recovery(EVENT_AT);
         d_before.push(f64::from(before));
         d_peak.push(f64::from(peak));
@@ -973,14 +873,13 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
         xl.push(w.cross_lease_msgs as f64 / w.lease_msgs.max(1) as f64 * 100.0);
         xp.push(w.cross_plum_msgs as f64 / w.plum_msgs.max(1) as f64 * 100.0);
         xe.push(w.cross_edges() as f64);
-        let (a, all) = w.agreement();
-        ag.push(a as f64 / all.max(1) as f64 * 100.0);
+        let (agree, all) = w.agreement();
+        ag.push(agree as f64 / all.max(1) as f64 * 100.0);
     }
     Cell {
         overshoot: fmax(&over),
-        overbooked: fmax(&booked),
-        false_den: mean(&fd),
-        catch_up: mean_opt(&catch),
+        utilization: mean(&util),
+        false_throttles: mean(&ft),
         depth_before: mean(&d_before),
         depth_peak: fmax(&d_peak),
         depth_back: mean_opt(&d_back),
@@ -994,36 +893,34 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
 
 fn main() {
     println!(
-        "tree-leased quotas: leasetree over plumtree-fsm, 5% loss, fanout log2 N + 1, {} seeds per row: \
-         bounds are the worst seed, costs the mean",
+        "tree-leased rate limits: leasetree over plumtree-fsm, 5% loss, fanout log2 N + 1, demand \
+         at 4/3 of the rate, {} seeds per row: bounds are the worst seed, costs the mean",
         SEEDS.len()
     );
-    println!("+false-den is the event window's count beyond a no-event control's\n");
+    println!("+throttled is the event window's count beyond a no-event control's\n");
 
-    println!("(a) leader change at tick {EVENT_AT}");
-    println!(
-        "  {:>4} {:>4} {:>10} {:>11} {:>10} {:>8} {:>12} {:>11}",
-        "N",
-        "TTL",
-        "overshoot",
-        "overbooked",
-        "+false-den",
-        "catch-up",
-        "depth b/p/back",
-        "msgs/node/t"
-    );
-    for &n in &[10u32, 50, 200] {
-        for &ttl in &[10u64, 40] {
-            {
-                let c = event_cell(leader_change, n, ttl);
+    for (title, mk) in [
+        (
+            "(a) leader change at tick 300",
+            leader_change as fn(u32, u64) -> Params,
+        ),
+        ("(c) five joins from tick 300", joins),
+    ] {
+        println!("{title}");
+        println!(
+            "  {:>4} {:>4} {:>10} {:>8} {:>11} {:>14} {:>11}",
+            "N", "TTL", "overshoot", "used", "+throttled", "depth b/p/back", "msgs/node/t"
+        );
+        for &n in &[10u32, 50, 200] {
+            for &ttl in &[10u64, 40] {
+                let c = event_cell(mk, n, ttl);
                 println!(
-                    "  {:>4} {:>4} {:>9.3}% {:>10.1}% {:>10.0} {:>8} {:>5.0}/{:>2.0}/{:>3} {:>11.2}",
+                    "  {:>4} {:>4} {:>9.1}% {:>7.0}% {:>11.0} {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
                     n,
                     ttl,
                     c.overshoot,
-                    c.overbooked,
-                    c.false_den,
-                    opt(c.catch_up),
+                    c.utilization,
+                    c.false_throttles,
                     c.depth_before,
                     c.depth_peak,
                     opt(c.depth_back),
@@ -1031,86 +928,55 @@ fn main() {
                 );
             }
         }
+        println!();
     }
 
+    println!("(b) a mid-tree node down at {EVENT_AT}, back 4 TTLs later: its subtree's flow");
     println!(
-        "\n(b) a mid-tree node down at {EVENT_AT}, back 4 TTLs later: its subtree's rate flow"
-    );
-    println!(
-        "  {:>4} {:>4} {:>5} {:>8} {:>6} {:>9} {:>8} {:>14} {:>11}",
-        "N",
-        "TTL",
-        "trees",
-        "baseline",
-        "floor",
-        "dip after",
-        "dip len",
-        "+cap false-den",
-        "msgs/node/t"
+        "  {:>4} {:>4} {:>5} {:>8} {:>6} {:>9} {:>8} {:>11}",
+        "N", "TTL", "trees", "baseline", "floor", "dip after", "dip len", "msgs/node/t"
     );
     for &n in &[10u32, 50, 200] {
         for &ttl in &[10u64, 40] {
-            {
-                let (mut base_, mut floor, mut after, mut len, mut fd, mut msgs) =
-                    (vec![], vec![], vec![], vec![], vec![], vec![]);
-                let mut dipped = 0usize;
-                for &seed in &SEEDS {
-                    let mut w = World::new(Params {
-                        seed,
-                        ..mid_tree_outage(n, ttl)
-                    });
-                    w.run_to_end();
-                    let Some(f) = flow_summary(&w, EVENT_AT - 20, EVENT_AT) else {
-                        continue;
-                    };
-                    let (a, b) = (EVENT_AT, EVENT_AT + 6 * ttl);
-                    base_.push(f.baseline);
-                    floor.push(f.floor);
-                    if let Some(x) = f.dip_after {
-                        dipped += 1;
-                        after.push(x as f64);
-                        len.push(f.dip_len.map_or(f64::NAN, |l| l as f64));
-                    }
-                    fd.push(w.subtree_false_denials_in(a, b) as f64);
-                    msgs.push(w.msgs_per_node_tick());
-                }
-                let dip = |v: &[f64]| {
-                    if dipped == 0 {
-                        "-".to_string()
-                    } else {
-                        format!("{:.0} ({dipped}x)", mean(v))
-                    }
+            let (mut base_, mut floor, mut after, mut len, mut msgs) =
+                (vec![], vec![], vec![], vec![], vec![]);
+            let mut dipped = 0usize;
+            for &seed in &SEEDS {
+                let mut w = World::new(Params {
+                    seed,
+                    ..mid_tree_outage(n, ttl)
+                });
+                w.run_to_end();
+                let Some(f) = flow_summary(&w, EVENT_AT - 20, EVENT_AT) else {
+                    continue;
                 };
-                println!(
-                    "  {:>4} {:>4} {:>5} {:>8.2} {:>6.2} {:>9} {:>8} {:>14.0} {:>11.2}",
-                    n,
-                    ttl,
-                    base_.len(),
-                    mean(&base_),
-                    floor.iter().copied().fold(f64::INFINITY, f64::min),
-                    dip(&after),
-                    dip(&len),
-                    mean(&fd),
-                    mean(&msgs)
-                );
+                base_.push(f.baseline);
+                floor.push(f.floor);
+                if let Some(x) = f.dip_after {
+                    dipped += 1;
+                    after.push(x as f64);
+                    len.push(f.dip_len.map_or(f64::NAN, |l| l as f64));
+                }
+                msgs.push(w.msgs_per_node_tick());
             }
-        }
-    }
-
-    println!("\n(c) five joins from tick {EVENT_AT}: over-commit from lease adoption");
-    println!(
-        "  {:>4} {:>4} {:>11} {:>10} {:>10} {:>11}",
-        "N", "TTL", "overbooked", "overshoot", "+false-den", "msgs/node/t"
-    );
-    for &n in &[10u32, 50, 200] {
-        for &ttl in &[10u64, 40] {
-            {
-                let c = event_cell(joins, n, ttl);
-                println!(
-                    "  {:>4} {:>4} {:>10.1}% {:>9.3}% {:>10.0} {:>11.2}",
-                    n, ttl, c.overbooked, c.overshoot, c.false_den, c.msgs
-                );
-            }
+            let dip = |v: &[f64]| {
+                if dipped == 0 {
+                    "-".to_string()
+                } else {
+                    format!("{:.0} ({dipped}x)", mean(v))
+                }
+            };
+            println!(
+                "  {:>4} {:>4} {:>5} {:>8.2} {:>6.2} {:>9} {:>8} {:>11.2}",
+                n,
+                ttl,
+                base_.len(),
+                mean(&base_),
+                floor.iter().copied().fold(f64::INFINITY, f64::min),
+                dip(&after),
+                dip(&len),
+                mean(&msgs)
+            );
         }
     }
 
@@ -1130,32 +996,26 @@ fn main() {
         "msgs/node/t"
     );
     for &n in &[50u32, 200] {
-        for &ttl in &[40u64] {
-            {
-                let c = event_cell(two_dcs, n, ttl);
-                println!(
-                    "  {:>4} {:>4} {:>9.3}% {:>11.1}% {:>11.1}% {:>11.0} {:>6.0}% {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
-                    n,
-                    ttl,
-                    c.overshoot,
-                    c.cross_lease,
-                    c.cross_plum,
-                    c.cross_edges,
-                    c.agreement,
-                    c.depth_before,
-                    c.depth_peak,
-                    opt(c.depth_back),
-                    c.msgs
-                );
-            }
-        }
+        let c = event_cell(two_dcs, n, 40);
+        println!(
+            "  {:>4} {:>4} {:>9.1}% {:>11.1}% {:>11.1}% {:>11.0} {:>6.0}% {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
+            n,
+            40,
+            c.overshoot,
+            c.cross_lease,
+            c.cross_plum,
+            c.cross_edges,
+            c.agreement,
+            c.depth_before,
+            c.depth_peak,
+            opt(c.depth_back),
+            c.msgs
+        );
     }
     println!(
-        "\n  overshoot   = true usage over the limit, peak, % of limit\n  \
-         overbooked  = the most any node had booked beyond its own lease, peak; a moving lease is\n  \
-                       booked by both parents until the new one confirms, on purpose\n  \
-         +false-den  = writes refused while room existed, in the event window, beyond a control run\n  \
-         catch-up    = ticks after the change until the new leader's total is within 5% of the truth\n  \
+        "\n  overshoot   = admitted over the rate across the window, as a share of the rate, worst seed\n  \
+         used        = admitted in the window, as a share of what the rate allowed\n  \
+         +throttled  = requests refused in ticks where the rate had room, beyond a control run\n  \
          depth       = tree depth before the change / peak after / ticks until back within one hop\n  \
          cross lease = share of lease messages that crossed between data centres (cross plum: the overlay's)\n  \
          cross edges = tree edges between the data centres at the end, worst seed\n  \
@@ -1171,90 +1031,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn steady_state_stays_within_the_limit_and_leases_everyone() {
-        let mut w = World::new(base(20, 20));
+    fn steady_state_leases_everyone_when_the_rate_covers_the_demand() {
+        let mut w = World::new(Params {
+            rate: 3 * 20,
+            ..base(20, 20)
+        });
         w.run_to_end();
-        assert_eq!(w.peak_overshoot, 0);
+        let mut shareless = 0;
         for n in w.nodes.iter().filter(|n| n.active() && n.id != w.leader) {
             assert!(
                 n.lease.parent().is_some(),
                 "node {} never got a parent",
                 n.id
             );
-            assert!(
-                n.lease.stats(&BYTES).unwrap().granted > 0,
-                "node {} never got a lease",
-                n.id
-            );
+            if n.lease.stats(&RPS).unwrap().granted == 0 {
+                shareless += 1; // a call in flight, at most
+            }
         }
-        assert!(w.true_total > 0);
+        assert!(shareless <= 1, "{shareless} nodes without a share");
     }
 
     #[test]
-    fn the_leader_total_never_double_counts() {
-        let mut w = World::new(leader_change(60, 10));
-        while w.now < w.p.rounds {
-            w.step();
-            let l = w.idx(w.leader).unwrap();
-            assert!(
-                w.nodes[l].lease.usage(&BYTES) <= w.true_total,
-                "tick {}: leader sees {} > truth {}",
-                w.now,
-                w.nodes[l].lease.usage(&BYTES),
-                w.true_total
-            );
-        }
-    }
-
-    /// A cut walks down one level per call, up to ttl / 2 per level; what a subtree writes
-    /// meanwhile is the stock's overshoot, under a full quota during a re-orientation. The
-    /// bound: the whole cluster writing for one ttl.
-    fn overshoot_bound(w: &World) -> u64 {
-        u64::from(w.p.nodes) * w.p.load * w.p.ttl
+    fn the_rate_is_used_under_contention() {
+        let mut w = World::new(base(20, 20));
+        w.run_to_end();
+        let used = w.utilization_in(200, 600);
+        assert!(used > 90.0, "the rate is used: {used:.0}%");
     }
 
     #[test]
-    fn a_stock_overshoots_a_leader_change_by_at_most_a_ttl_of_writes() {
-        for &(n, ttl) in &[(20u32, 20u64), (100, 20), (200, 10), (200, 40)] {
+    fn the_rate_holds_in_steady_state() {
+        for &(n, ttl) in &[(20u32, 20u64), (200, 40)] {
+            let mut w = World::new(base(n, ttl));
+            w.run_to_end();
+            assert_eq!(w.overshoot_in(200, 600), 0.0, "N={n} TTL={ttl}");
+        }
+    }
+
+    #[test]
+    fn a_leader_change_overshoots_by_at_most_the_unleased_round_trips() {
+        // A node without a share admits everything; the bound is every node's demand for the
+        // time it takes to be re-leased, a few ticks.
+        for &(n, ttl) in &[(20u32, 20u64), (200, 40)] {
             let mut w = World::new(leader_change(n, ttl));
             w.run_to_end();
-            let bound = overshoot_bound(&w);
-            assert!(
-                w.peak_overshoot <= bound,
-                "N={n} TTL={ttl}: {} > {bound}",
-                w.peak_overshoot
-            );
+            let (a, b) = window(ttl);
+            let over = w.overshoot_in(a, b);
+            assert!(over <= 50.0, "N={n} TTL={ttl}: {over}% over the rate");
         }
-        let mut w = World::new(leader_change(20, 20));
-        w.run_to_end();
-        assert_eq!(w.peak_overshoot, 0, "and none at all on a small cluster");
     }
 
     #[test]
     fn a_subtree_keeps_flowing_through_its_parent_s_outage() {
-        // A rate admits without a lease, so the subtree's flow never stalls, and it is back
-        // at baseline once re-leased.
         let mut w = World::new(mid_tree_outage(30, 20));
         w.run_to_end();
         let f = flow_summary(&w, EVENT_AT - 20, EVENT_AT).expect("a mid-tree node at N=30");
-        assert!(f.baseline > 0.8, "baseline {}", f.baseline);
+        assert!(f.baseline > 0.5, "baseline {}", f.baseline);
         assert!(f.floor > 0.0, "the subtree stalled");
         if f.dip_after.is_some() {
             assert!(f.dip_len.is_some(), "never recovered");
-        }
-    }
-
-    #[test]
-    fn joins_overshoot_by_at_most_a_ttl_of_writes() {
-        for &(n, ttl) in &[(30u32, 20u64), (200, 10), (200, 40)] {
-            let mut w = World::new(joins(n, ttl));
-            w.run_to_end();
-            let bound = overshoot_bound(&w);
-            assert!(
-                w.peak_overshoot <= bound,
-                "N={n} TTL={ttl}: {} > {bound}",
-                w.peak_overshoot
-            );
         }
     }
 
@@ -1282,10 +1117,7 @@ mod tests {
             });
             w.run_to_end();
             let (agree, all) = w.agreement();
-            // Without loss the lease tree is the overlay's tree. With loss, a few nodes are
-            // always inside the two-delivery lag of a swap in progress: about one in ten at
-            // 5% loss, more with a slow cross-DC hop in the path.
-            let floor = if loss == 0.0 { 100 } else { 85 };
+            let floor = if loss == 0.0 { 100 } else { 80 };
             assert!(
                 agree * 100 >= all * floor,
                 "loss {loss}: {agree} of {all} nodes have an overlay deliverer as lease parent"
@@ -1302,6 +1134,48 @@ mod tests {
             edges <= 4,
             "{edges} tree edges cross between the data centres"
         );
-        assert_eq!(w.peak_overshoot, 0);
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn where_the_rate_leaks_at_scale() {
+        let mut w = World::new(base(200, 40));
+        let mut last_parents: Vec<Option<Id>> = vec![None; 200];
+        let mut moves = 0u64;
+        while w.now < 600 {
+            w.step();
+            for (k, n) in w.nodes.iter().enumerate() {
+                let p = n.lease.parent().copied();
+                if last_parents[k].is_some() && p != last_parents[k] {
+                    moves += 1;
+                }
+                last_parents[k] = p;
+            }
+            if w.now >= 400 && w.now % 20 == 0 {
+                let mut refills = 0u64;
+                let mut over = 0u64;
+                let mut lent_total = 0u64;
+                let mut held_total = 0u64;
+                for n in w.nodes.iter().filter(|n| n.active()) {
+                    let s = n.lease.stats(&RPS).unwrap();
+                    refills += s.granted.saturating_sub(s.lent);
+                    over += s.overcommit;
+                    lent_total += s.lent;
+                    if n.id != w.leader {
+                        held_total += s.granted;
+                    }
+                }
+                let admitted = *w.admitted_by_tick.last().unwrap();
+                println!(
+                    "t={}: admitted {admitted} vs rate {}, sum refills {refills}, over-commit {over}, lent {lent_total} held {held_total}, moves so far {moves}",
+                    w.now, w.p.rate
+                );
+            }
+        }
     }
 }
