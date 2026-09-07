@@ -72,8 +72,10 @@ struct Node {
     up: bool,
     /// True own usage of the stock: what the durable per-node table would hold.
     used: u64,
-    /// The hop count the leader's latest message arrived at.
+    /// The hop count the leader's latest message arrived at, and the peer it came through.
     depth: Option<u16>,
+    /// The peers the last two of the leader's messages came through.
+    deliverers: [Option<Id>; 2],
     offered: u64,
     admitted: u64,
 }
@@ -273,6 +275,7 @@ impl World {
             up: true,
             used: 0,
             depth: None,
+            deliverers: [None, None],
             offered: 0,
             admitted: 0,
         }
@@ -419,6 +422,8 @@ impl World {
                     if let PMessage::Gossip { id, round, .. } = &pm {
                         if id.0 == self.leader {
                             self.nodes[i].depth = Some(*round);
+                            let n = &mut self.nodes[i];
+                            n.deliverers = [Some(m.from), n.deliverers[0]];
                         }
                     }
                     let kind = match &pm {
@@ -593,6 +598,25 @@ impl World {
             }
         }
         (before, peak, back)
+    }
+
+    /// How many non-leader nodes have as lease parent a peer that delivered one of the last
+    /// two of the leader's messages to them: the lease tree's agreement with the overlay's,
+    /// allowing the one detour the parent rule allows.
+    fn agreement(&self) -> (usize, usize) {
+        let nodes: Vec<&Node> = self
+            .nodes
+            .iter()
+            .filter(|n| n.active() && n.id != self.leader)
+            .collect();
+        let agree = nodes
+            .iter()
+            .filter(|n| {
+                let p = n.lease.parent();
+                p.is_some() && n.deliverers.iter().any(|d| d.as_ref() == p)
+            })
+            .count();
+        (agree, nodes.len())
     }
 
     /// Tree edges whose ends are in different data centres, right now.
@@ -908,6 +932,7 @@ struct Cell {
     cross_lease: f64,
     cross_plum: f64,
     cross_edges: f64,
+    agreement: f64,
 }
 
 fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
@@ -922,6 +947,7 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
     let mut xl = vec![];
     let mut xp = vec![];
     let mut xe = vec![];
+    let mut ag = vec![];
     for &seed in &SEEDS {
         let mut w = World::new(Params { seed, ..mk(n, ttl) });
         w.run_to_end();
@@ -947,6 +973,8 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
         xl.push(w.cross_lease_msgs as f64 / w.lease_msgs.max(1) as f64 * 100.0);
         xp.push(w.cross_plum_msgs as f64 / w.plum_msgs.max(1) as f64 * 100.0);
         xe.push(w.cross_edges() as f64);
+        let (a, all) = w.agreement();
+        ag.push(a as f64 / all.max(1) as f64 * 100.0);
     }
     Cell {
         overshoot: fmax(&over),
@@ -960,6 +988,7 @@ fn event_cell(mk: fn(u32, u64) -> Params, n: u32, ttl: u64) -> Cell {
         cross_lease: mean(&xl),
         cross_plum: mean(&xp),
         cross_edges: fmax(&xe),
+        agreement: mean(&ag),
     }
 }
 
@@ -1089,13 +1118,14 @@ fn main() {
         "\n(d) two data centres (latency 1 inside, 10 across), with a leader change at {EVENT_AT}"
     );
     println!(
-        "  {:>4} {:>4} {:>10} {:>12} {:>12} {:>11} {:>14} {:>11}",
+        "  {:>4} {:>4} {:>10} {:>12} {:>12} {:>11} {:>7} {:>14} {:>11}",
         "N",
         "TTL",
         "overshoot",
         "cross lease",
         "cross plum",
         "cross edges",
+        "follows",
         "depth b/p/back",
         "msgs/node/t"
     );
@@ -1104,13 +1134,14 @@ fn main() {
             {
                 let c = event_cell(two_dcs, n, ttl);
                 println!(
-                    "  {:>4} {:>4} {:>9.3}% {:>11.1}% {:>11.1}% {:>11.0} {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
+                    "  {:>4} {:>4} {:>9.3}% {:>11.1}% {:>11.1}% {:>11.0} {:>6.0}% {:>7.0}/{:>2.0}/{:>3} {:>11.2}",
                     n,
                     ttl,
                     c.overshoot,
                     c.cross_lease,
                     c.cross_plum,
                     c.cross_edges,
+                    c.agreement,
                     c.depth_before,
                     c.depth_peak,
                     opt(c.depth_back),
@@ -1128,6 +1159,7 @@ fn main() {
          depth       = tree depth before the change / peak after / ticks until back within one hop\n  \
          cross lease = share of lease messages that crossed between data centres (cross plum: the overlay's)\n  \
          cross edges = tree edges between the data centres at the end, worst seed\n  \
+         follows     = nodes whose lease parent delivered one of the last two of the leader's messages\n  \
          trees       = seeds whose tree had a mid-tree node to take down\n  \
          dip after   = ticks from the outage until the subtree's flow fell below 95% of baseline\n  \
          dip len     = ticks it then stayed down (and in how many seeds it dipped at all)"
@@ -1234,6 +1266,30 @@ mod tests {
         assert!(back.is_some(), "the tree never came back to depth {before}");
         let last = *w.depth_by_tick.last().unwrap();
         assert!(last <= before + 1, "ended at depth {last}, was {before}");
+    }
+
+    #[test]
+    fn the_lease_tree_settles_on_the_overlay_s_tree() {
+        for (mk, loss) in [
+            (leader_change as fn(u32, u64) -> Params, 0.0),
+            (leader_change, 0.05),
+            (two_dcs, 0.0),
+            (two_dcs, 0.05),
+        ] {
+            let mut w = World::new(Params {
+                loss,
+                ..mk(200, 40)
+            });
+            w.run_to_end();
+            let (agree, all) = w.agreement();
+            // Without loss the lease tree is the overlay's tree. With loss, a few nodes are
+            // always inside the two-delivery lag of a swap in progress.
+            let floor = if loss == 0.0 { 100 } else { 90 };
+            assert!(
+                agree * 100 >= all * floor,
+                "loss {loss}: {agree} of {all} nodes have an overlay deliverer as lease parent"
+            );
+        }
     }
 
     #[test]

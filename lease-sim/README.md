@@ -23,7 +23,10 @@ over-booking) are the worst seed; costs are the mean.
 - **(b) a mid-tree node down and back**: when its subtree's rate flow drops, how far, how long.
 - **(c) five joins**: the over-commit from lease adoption.
 - **(d) two data centres** at latency 1 inside and 10 across, with a leader change: the share
-  of lease and overlay traffic that crosses, and the number of tree edges that do.
+  of lease and overlay traffic that crosses, the number of tree edges that do, and how many
+  nodes' lease parent is the peer the overlay delivers through. The lease tree has no shape
+  of its own: at zero loss it is the overlay's tree exactly, and under loss a few nodes are
+  always inside the two-delivery lag of a swap in progress.
 
 ## Reading the numbers
 
