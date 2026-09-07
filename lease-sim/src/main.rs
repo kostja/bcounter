@@ -23,7 +23,7 @@
 
 use std::collections::BTreeSet;
 
-use leasetree::tree::{place, Place};
+use leasetree::tree::{place, weights, Place};
 use leasetree::{Action as LAction, Config as LConfig, Lease, LeaseRequest, LeaseResponse, Limit};
 
 type Id = u32;
@@ -186,8 +186,10 @@ impl World {
         let list: Vec<Id> = members.iter().map(|(id, _)| *id).collect();
         let (id, leader, term) = (n.id, n.seen_leader, n.seen_term);
         let p = place(&id, &leader, &members, self.p.radix);
+        let w = weights(&id, &leader, &members, self.p.radix);
         let n = &mut self.nodes[i];
         n.lease.set_cluster_view(Some(&list), leader, term);
+        n.lease.set_weights(&w);
         if let Some(Place::Under(parent)) = p {
             n.lease.set_parent(parent);
         }
@@ -627,10 +629,11 @@ fn base(nodes: u32, ttl: u64) -> Params {
         cross_latency: 10,
         ttl,
         // Demand is 2 per node per tick; the rate allows three quarters of it, so the limit
-        // binds and shares must move to where the load is.
+        // binds and shares must move to where the load is. A chunk is below a node's fair
+        // share, as a deployment would size it: the split's hysteresis is one chunk.
         rate: 3 * u64::from(nodes) / 2,
         offered: 2,
-        chunk: 2,
+        chunk: 1,
         view_delay: 3,
         fd_delay: 5,
         rounds: 600,
